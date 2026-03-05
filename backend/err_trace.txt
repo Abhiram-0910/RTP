@@ -1,0 +1,21 @@
+Traceback (most recent call last):
+  File "C:\Users\rohan\Downloads\movie-rec-project\backend\enhanced_main.py", line 74, in initialize_services
+    print("✅ All services initialized successfully")
+  File "C:\Users\rohan\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 0: character maps to <undefined>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\rohan\Downloads\movie-rec-project\backend\test_import.py", line 5, in <module>
+    import enhanced_main
+  File "C:\Users\rohan\Downloads\movie-rec-project\backend\enhanced_main.py", line 85, in <module>
+    initialize_services()
+  File "C:\Users\rohan\Downloads\movie-rec-project\backend\enhanced_main.py", line 77, in initialize_services
+    print(f"⚠️ Error initializing services: {e}")
+  File "C:\Users\rohan\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-1: character maps to <undefined>
