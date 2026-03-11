@@ -5,12 +5,51 @@ from langchain_core.embeddings import Embeddings
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import os
+import json
 import requests
 import google.generativeai as genai
 
 # Database imports — pgvector search uses SQLAlchemy directly
 from database import SessionLocal, Media, Interaction, MediaEmbedding, PGVECTOR_AVAILABLE
 from sqlalchemy import text as sa_text
+
+
+# ── Redis singleton for watch-provider caching ────────────────────────────────────────────────
+# The connection is created once at import time (lazy).  If Redis is unreachable
+# (offline, wrong URL, etc.) the helper returns None and every cache call is a
+# no-op — the engine degrades gracefully to live TMDB calls with zero exceptions.
+
+_redis_client = None
+_redis_initialised = False
+
+
+def _get_redis_client():
+    """
+    Return a connected ``redis.Redis`` instance, or ``None`` if Redis is 
+    unavailable.  The module-level ``_redis_client`` is initialised exactly
+    once and then reused for every subsequent call (connection pooling).
+    """
+    global _redis_client, _redis_initialised
+    if _redis_initialised:
+        return _redis_client
+
+    _redis_initialised = True
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+    try:
+        import redis as _redis_lib
+        client = _redis_lib.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
+        client.ping()  # fail-fast: confirms the connection is actually alive
+        _redis_client = client
+        print(f"[WatchProviders Cache] Redis connected at {redis_url}")
+    except Exception as exc:
+        _redis_client = None
+        print(f"[WatchProviders Cache] Redis unavailable ({exc}) — caching disabled.")
+    return _redis_client
+
+
+# Initialise eagerly so the status message appears at startup alongside other
+# backend readiness checks rather than on the first user request.
+_get_redis_client()
 
 
 # ── Gemini Embedding Wrapper ──────────────────────────────────────────────────
@@ -252,17 +291,32 @@ class RecommendationEngine:
         regions: list = None,
     ) -> list:
         """
-        Fetch streaming availability from TMDB's /watch/providers endpoint.
+        Fetch streaming availability from TMDB's /watch/providers endpoint,
+        with a **24-hour Redis cache layer** to avoid repeated live HTTP calls
+        for every movie in a results page.
+
+        Cache key schema
+        ----------------
+        ``providers:{media_type}:{tmdb_id}:{sorted_regions_csv}``
+        e.g. ``providers:movie:550:AU,CA,GB,IN,US``
+
+        The sorted region list is used so that callers passing the same regions
+        in different order share the same cache entry.
+
+        Redis unavailability
+        --------------------
+        If Redis is offline or returns an error the method falls through to a
+        live TMDB call and returns the result without caching — no exception
+        is raised and the user never notices.
 
         TMDB's watch provider data is sourced directly from JustWatch — this is
-        the officially sanctioned way to consume JustWatch data per their
-        partnership agreement.  Calling JustWatch's private API directly would
-        violate their ToS.
+        the officially sanctioned integration per their partnership agreement.
+        Calling JustWatch's private API directly would violate their ToS.
 
-        Returns a list of dicts:
+        Returns
+        -------
+        List of dicts:
           [{"provider": "Netflix", "type": "flatrate", "region": "US"}, ...]
-
-        The frontend can group by region for per-country availability badges.
         """
         if not self.tmdb_api_key:
             return []
@@ -270,6 +324,23 @@ class RecommendationEngine:
         if regions is None:
             regions = ["US", "IN", "GB", "CA", "AU"]
 
+        # ── 1. Build deterministic cache key ────────────────────────────────────────────────
+        regions_key = ",".join(sorted(regions))
+        cache_key = f"providers:{media_type}:{tmdb_id}:{regions_key}"
+        _PROVIDER_TTL = 86_400  # 24 hours in seconds
+
+        # ── 2. Cache read (Redis hit) ────────────────────────────────────────────────────────
+        rc = _get_redis_client()
+        if rc is not None:
+            try:
+                cached_raw = rc.get(cache_key)
+                if cached_raw:
+                    return json.loads(cached_raw)
+            except Exception as cache_read_exc:
+                # Redis read error — log and proceed to live call
+                print(f"[WatchProviders Cache] Read error for {cache_key}: {cache_read_exc}")
+
+        # ── 3. Cache miss — fetch live from TMDB ─────────────────────────────────────────────
         endpoint = "movie" if media_type == "movie" else "tv"
         url = f"https://api.themoviedb.org/3/{endpoint}/{tmdb_id}/watch/providers"
 
@@ -303,6 +374,13 @@ class RecommendationEngine:
                                 "logo_path": p.get("logo_path"),
                                 "source": "JustWatch via TMDB",
                             })
+
+            # ── 4. Cache write (Redis set with TTL) ─────────────────────────────────────────
+            if rc is not None:
+                try:
+                    rc.setex(cache_key, _PROVIDER_TTL, json.dumps(providers))
+                except Exception as cache_write_exc:
+                    print(f"[WatchProviders Cache] Write error for {cache_key}: {cache_write_exc}")
 
             return providers
 

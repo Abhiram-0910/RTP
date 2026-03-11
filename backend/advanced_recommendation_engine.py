@@ -1,8 +1,10 @@
 import hashlib
 import logging
 import warnings
+from functools import lru_cache
 
 import numpy as np
+import scipy.sparse as sp
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -11,6 +13,36 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# ── ALS backend availability check ──────────────────────────────────────────────────────
+# implicit is optional — if absent, MF score gracefully falls back to 0.5.
+try:
+    from implicit.als import AlternatingLeastSquares as _ALS
+    _ALS_AVAILABLE = True
+    logger.info("[MF] implicit library found — ALS matrix factorization enabled.")
+except ImportError:
+    _ALS_AVAILABLE = False
+    logger.warning(
+        "[MF] implicit not installed — matrix factorization will return 0.5 (neutral). "
+        "Install with: pip install implicit"
+    )
+
+# ── Sentiment backend selection ──────────────────────────────────────────────────────
+# We try VADER first (fast, dependency-free install: `pip install vaderSentiment`).
+# If it is not available we fall back to a HuggingFace zero-shot pipeline which
+# downloads on first use but requires no extra GPU.
+_VADER_ANALYZER = None
+_HF_SENTIMENT_PIPE = None
+
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer as _VaderAnalyzer
+    _VADER_ANALYZER = _VaderAnalyzer()
+    logger.info("[Sentiment] Using VADER for review polarity analysis.")
+except ImportError:
+    logger.warning(
+        "[Sentiment] vaderSentiment not installed — will attempt HuggingFace pipeline. "
+        "Install with: pip install vaderSentiment"
+    )
 
 
 class AdvancedRecommendationEngine:
@@ -163,6 +195,69 @@ class AdvancedRecommendationEngine:
 
     # ── Private Helpers ────────────────────────────────────────────────────────
 
+    def _calculate_sentiment_score(self, reviews_text: str) -> float:
+        """
+        Parse *reviews_text* and return a **normalised polarity score** in [-1.0, 1.0].
+
+        Positive scores  (+0.1 → +1.0) indicate overwhelmingly favourable reviews.
+        Negative scores  (-0.1 → -1.0) indicate predominantly critical/negative reviews.
+        Values near zero indicate mixed or neutral sentiment.
+
+        Backend priority
+        ----------------
+        1. **VADER** (``vaderSentiment``) — fast, rule-based, great for short review
+           snippets. Returns the ``compound`` score which is already in [-1, 1].
+        2. **HuggingFace pipeline** (``distilbert-base-uncased-finetuned-sst-2-english``
+           loaded lazily) — slightly slower but more accurate on full sentences.
+        3. Neutral fallback (0.0) when no backend is available.
+        """
+        global _VADER_ANALYZER, _HF_SENTIMENT_PIPE
+
+        if not reviews_text or not reviews_text.strip():
+            return 0.0  # No review data — neutral
+
+        # Truncate to keep inference fast; most review snippets fit in 512 tokens
+        text = reviews_text.strip()[:1024]
+
+        # ── Path 1: VADER ───────────────────────────────────────────────────────────
+        if _VADER_ANALYZER is not None:
+            try:
+                scores = _VADER_ANALYZER.polarity_scores(text)
+                return float(scores["compound"])  # already in [-1, 1]
+            except Exception as exc:
+                logger.warning("VADER scoring failed: %s", exc)
+
+        # ── Path 2: HuggingFace pipeline (lazy-loaded) ───────────────────────────
+        if _HF_SENTIMENT_PIPE is None:
+            try:
+                from transformers import pipeline as hf_pipeline  # noqa: PLC0415
+                _HF_SENTIMENT_PIPE = hf_pipeline(
+                    "sentiment-analysis",
+                    model="distilbert-base-uncased-finetuned-sst-2-english",
+                    truncation=True,
+                    max_length=512,
+                )
+                logger.info("[Sentiment] Loaded HuggingFace distilbert-sst2 pipeline.")
+            except Exception as exc:
+                logger.warning("[Sentiment] Could not load HuggingFace pipeline: %s", exc)
+
+        if _HF_SENTIMENT_PIPE is not None:
+            try:
+                result = _HF_SENTIMENT_PIPE(text[:512])[0]  # pipeline max_length guard
+                # result = {"label": "POSITIVE"|"NEGATIVE", "score": 0.0–1.0}
+                raw_score = float(result["score"])  # confidence in [0.5, 1.0]
+                # Map to signed polarity:
+                #   POSITIVE confidence 0.9 → +0.8,  NEGATIVE confidence 0.9 → -0.8
+                polarity = (raw_score - 0.5) * 2  # [0, 1] range
+                if result["label"] == "NEGATIVE":
+                    polarity = -polarity
+                return float(np.clip(polarity, -1.0, 1.0))
+            except Exception as exc:
+                logger.warning("HuggingFace sentiment inference failed: %s", exc)
+
+        # ── Path 3: Neutral fallback ────────────────────────────────────────────────
+        return 0.0
+
     def _calculate_content_scores(
         self, query_embedding: np.ndarray, items: List[Dict]
     ) -> List[float]:
@@ -177,7 +272,11 @@ class AdvancedRecommendationEngine:
             except Exception:
                 similarity = 0.5
 
-            quality_boost = self._calculate_quality_boost(item)
+            # Compute a sentiment score from review text SEPARATELY from the embedding
+            sentiment_score = self._calculate_sentiment_score(
+                item.get("reviews_text", "") or ""
+            )
+            quality_boost = self._calculate_quality_boost(item, sentiment_score)
             genre_boost = self._calculate_genre_boost(item)
             final_score = float(similarity) * (1 + quality_boost + genre_boost)
             scores.append(min(final_score, 1.0))
@@ -187,6 +286,11 @@ class AdvancedRecommendationEngine:
         """
         Return a real embedding for the item.
         Uses the shared HuggingFace model if available, otherwise TF-IDF hash.
+
+        Reviews are intentionally EXCLUDED from the embedding text.
+        They are opinion-laden and pollute semantic similarity with sentiment words
+        rather than thematic content. Sentiment is handled separately by
+        ``_calculate_sentiment_score`` and fed into the quality multiplier.
         """
         text_parts = [item.get("title", "")]
         genres = item.get("genres", [])
@@ -197,10 +301,11 @@ class AdvancedRecommendationEngine:
             text_parts.append(" ".join(keywords[:10]))
         text_parts.append(item.get("overview", "")[:300])
 
-        # Append aggregated review snippets to enrich the embedding with critic/user sentiment
-        reviews_text = item.get("reviews_text", "") or ""
-        if reviews_text.strip():
-            text_parts.append(reviews_text.strip()[:200])
+        # NOTE: reviews_text is deliberately NOT appended here.
+        # Raw review snippets were mixing semantic content with polarity words
+        # ("brilliant", "dull"), causing the embedding to partially encode
+        # sentiment instead of theme. Sentiment is now extracted explicitly via
+        # _calculate_sentiment_score() and applied as a quality boost multiplier.
 
         text = ". ".join(p for p in text_parts if p)
 
@@ -271,23 +376,62 @@ class AdvancedRecommendationEngine:
         norm = np.linalg.norm(dense)
         return dense / norm if norm > 0 else dense
 
-    def _calculate_quality_boost(self, item: Dict) -> float:
+    def _calculate_quality_boost(self, item: Dict, sentiment_score: float = 0.0) -> float:
+        """
+        Compute a quality multiplier for an item in the range [0.0, 0.65].
+
+        Components
+        ----------
+        Rating boost (0 – 0.30)
+            Based on the TMDB vote_average stored in ``item["rating"]``.
+
+        Popularity boost (0 – 0.15)
+            Based on the item's TMDB popularity score.
+
+        Sentiment boost (−0.20 – +0.20)
+            Based on ``sentiment_score``, a normalised polarity in [-1, 1]:
+            * > +0.5  → strong positive boost  (+0.20)
+            * > +0.1  → mild  positive boost    (+0.10)
+            * < -0.5  → strong negative penalty (−0.20)
+            * < -0.1  → mild  negative penalty  (−0.10)
+            * otherwise → neutral (0)
+
+        The total is clamped to 0.65 so that even a perfect item cannot
+        dominate the relevance score entirely.
+        """
         quality_score = 0.0
+
+        # ── Rating boost ─────────────────────────────────────────────────────────────
         rating = item.get("rating", 0)
         if rating >= 8.5:
-            quality_score += 0.3
+            quality_score += 0.30
         elif rating >= 7.5:
-            quality_score += 0.2
+            quality_score += 0.20
         elif rating >= 6.5:
-            quality_score += 0.1
+            quality_score += 0.10
 
+        # ── Popularity boost ──────────────────────────────────────────────────────────
         popularity = item.get("popularity", 0)
         if popularity > 100:
-            quality_score += 0.2
+            quality_score += 0.15
         elif popularity > 50:
-            quality_score += 0.1
+            quality_score += 0.08
 
-        return min(quality_score, 0.5)
+        # ── Sentiment boost / penalty ──────────────────────────────────────────────────
+        # sentiment_score is in [-1.0, +1.0]:
+        #   +1.0 → uniformly glowing reviews → max +0.20 boost
+        #   -1.0 → uniformly panned reviews  → max -0.20 penalty
+        if sentiment_score > 0.5:
+            quality_score += 0.20
+        elif sentiment_score > 0.1:
+            quality_score += 0.10
+        elif sentiment_score < -0.5:
+            quality_score -= 0.20
+        elif sentiment_score < -0.1:
+            quality_score -= 0.10
+        # Neutral band (-0.1 to +0.1): no adjustment
+
+        return min(quality_score, 0.65)   # increased ceiling to 0.65 (was 0.50)
 
     def _calculate_genre_boost(self, item: Dict) -> float:
         return 0.1  # Neutral; user-specific boost would require preference data
@@ -345,7 +489,13 @@ class AdvancedRecommendationEngine:
 
         genre_novelty = 1 - len(item_genres.intersection(user_genres)) / max(len(item_genres), 1)
         keyword_novelty = 1 - len(item_keywords.intersection(user_keywords)) / max(len(item_keywords), 1)
-        quality_score = self._calculate_quality_boost(item)
+
+        # Use sentiment-aware quality boost so critically loved hidden gems
+        # can still surface even when they are far outside the user's usual genres
+        sentiment_score = self._calculate_sentiment_score(
+            item.get("reviews_text", "") or ""
+        )
+        quality_score = self._calculate_quality_boost(item, sentiment_score)
 
         return genre_novelty * 0.4 + keyword_novelty * 0.3 + quality_score * 0.3
 
@@ -414,13 +564,216 @@ class AdvancedRecommendationEngine:
                 total_sim += similarity
         return score / total_sim if total_sim > 0 else 0.5
 
+    # ── ALS Matrix Factorization helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _matrix_to_csr(
+        user_item_dict: Dict[str, Dict],
+    ) -> Tuple["sp.csr_matrix", Dict[str, int], Dict[int, str], Dict[str, int], Dict[int, str]]:
+        """
+        Convert the nested dict ``{user_id: {item_id: rating}}`` produced by
+        ``_build_user_item_matrix`` into a SciPy CSR sparse matrix and the
+        bidirectional index mappings required by the ALS model.
+
+        Returns
+        -------
+        csr         : items × users CSR matrix  (implicit expects item-major)
+        user2idx    : str user_id  → int column index
+        idx2user    : int column index  → str user_id
+        item2idx    : str item_id  → int row index
+        idx2item    : int row index  → str item_id
+        """
+        # Build contiguous integer indices for every user and item seen
+        user_ids = sorted(user_item_dict.keys())
+        item_ids = sorted(
+            {str(iid) for u_ratings in user_item_dict.values() for iid in u_ratings}
+        )
+
+        user2idx: Dict[str, int] = {u: i for i, u in enumerate(user_ids)}
+        idx2user: Dict[int, str] = {i: u for u, i in user2idx.items()}
+        item2idx: Dict[str, int] = {it: i for i, it in enumerate(item_ids)}
+        idx2item: Dict[int, str] = {i: it for it, i in item2idx.items()}
+
+        rows, cols, data = [], [], []
+        for user, ratings in user_item_dict.items():
+            u_idx = user2idx[user]
+            for item_id, rating in ratings.items():
+                i_idx = item2idx[str(item_id)]
+                rows.append(i_idx)     # item row
+                cols.append(u_idx)     # user column
+                data.append(float(rating))
+
+        n_items = len(item_ids)
+        n_users = len(user_ids)
+        csr = sp.csr_matrix((data, (rows, cols)), shape=(n_items, n_users), dtype=np.float32)
+        return csr, user2idx, idx2user, item2idx, idx2item
+
+    def _build_als_model(
+        self,
+        user_item_dict: Dict[str, Dict],
+        factors: int = 32,
+        iterations: int = 15,
+        regularization: float = 0.01,
+    ):
+        """
+        Train a lightweight ALS model on the interaction matrix derived from
+        *user_item_dict*.  The result is cached on the instance so that repeated
+        calls within the same request do not retrain unnecessarily.
+
+        The cache key is a frozenset fingerprint of ``(user_id, item_id, rating)``
+        triples, so the model is automatically rebuilt whenever the interaction
+        data changes.
+
+        Parameters
+        ----------
+        factors        : Number of latent dimensions (32 is fast and sufficient for
+                         small-to-medium corpora).
+        iterations     : ALS alternating steps (15 is enough for convergence at this scale).
+        regularization : L2 penalty to prevent overfitting on sparse data.
+
+        Returns
+        -------
+        (model, user2idx, idx2user, item2idx, idx2item)
+        or ``None`` if implicit is not installed or the matrix is too small.
+        """
+        if not _ALS_AVAILABLE:
+            return None
+
+        # Produce a stable fingerprint of the current interaction set
+        fingerprint = frozenset(
+            (u, str(iid), v)
+            for u, ratings in user_item_dict.items()
+            for iid, v in ratings.items()
+        )
+
+        # Serve the cached model if the interaction data hasn't changed
+        cached = getattr(self, "_als_cache", None)
+        if cached is not None and cached["key"] == fingerprint:
+            return cached["model"]
+
+        try:
+            csr, user2idx, idx2user, item2idx, idx2item = self._matrix_to_csr(user_item_dict)
+
+            # ALS needs at least 2 users and 2 items
+            if csr.shape[0] < 2 or csr.shape[1] < 2:
+                return None
+
+            model = _ALS(
+                factors=min(factors, csr.shape[1] - 1),  # factors must be < n_users
+                iterations=iterations,
+                regularization=regularization,
+                use_gpu=False,
+                calculate_training_loss=False,
+            )
+            # implicit ≥0.7 expects a user × items matrix for fit()
+            model.fit(csr.T.tocsr(), show_progress=False)
+
+            result = {
+                "key": fingerprint,
+                "model": (model, user2idx, idx2user, item2idx, idx2item),
+            }
+            self._als_cache = result
+            logger.info(
+                "[MF] ALS model trained: %d users × %d items, %d factors.",
+                csr.shape[1], csr.shape[0], model.factors,
+            )
+            return result["model"]
+
+        except Exception as exc:
+            logger.warning("[MF] ALS training failed: %s", exc)
+            return None
+
     def _item_based_score(self, item: Dict, user_id: str, user_interactions: List[Dict]) -> float:
-        # Simplified item-based: 0.5 neutral (full SVD would require offline training)
-        return 0.5
+        """
+        Item-based collaborative score using ALS item latent factors.
+
+        For each item the user has previously interacted with, compute the cosine
+        similarity between that item's ALS latent-factor vector and the candidate
+        item's latent-factor vector.  Return the weighted average, where the weight
+        is the user's implicit rating for the interacted item.
+
+        Falls back to 0.5 (neutral) on cold-start or when implicit is unavailable.
+        """
+        if not user_interactions or not _ALS_AVAILABLE:
+            return 0.5
+
+        user_item_matrix = self._build_user_item_matrix(user_interactions)
+        als_result = self._build_als_model(user_item_matrix)
+        if als_result is None:
+            return 0.5
+
+        model, user2idx, idx2user, item2idx, idx2item = als_result
+        candidate_id = str(item.get("id", ""))
+
+        if candidate_id not in item2idx:
+            return 0.5  # cold-start: item not seen during training
+
+        candidate_idx = item2idx[candidate_id]
+        # item_factors: shape (n_items, factors)
+        candidate_vec = model.item_factors[candidate_idx].reshape(1, -1)
+
+        user_rated = user_item_matrix.get(user_id, {})
+        if not user_rated:
+            return 0.5
+
+        total_weight = weighted_sim = 0.0
+        for rated_id, rating in user_rated.items():
+            rid = str(rated_id)
+            if rid == candidate_id or rid not in item2idx:
+                continue
+            rated_vec = model.item_factors[item2idx[rid]].reshape(1, -1)
+            sim = float(cosine_similarity(candidate_vec, rated_vec)[0][0])
+            # Weight positive interactions more heavily than neutral or negative ones
+            w = max(rating, 0.1)
+            weighted_sim += sim * w
+            total_weight += w
+
+        if total_weight == 0:
+            return 0.5
+
+        raw = weighted_sim / total_weight           # in roughly [-1, 1]
+        normalised = (raw + 1.0) / 2.0             # shift to [0, 1]
+        return float(np.clip(normalised, 0.0, 1.0))
 
     def _matrix_factorization_score(self, item: Dict, user_id: str, user_interactions: List[Dict]) -> float:
-        # Simplified: neutral score (full MF requires offline training)
-        return 0.5
+        """
+        Matrix-factorization score via ALS latent-factor dot product.
+
+        Retrieves the user vector ``p_u`` and item vector ``q_i`` from the trained
+        ALS model and returns ``sigmoid(p_u ⋅ q_i)`` as a score in (0, 1).  The
+        sigmoid maps the raw dot product from an unbounded range into a smooth
+        probability-like output, which mixes cleanly with the other score components.
+
+        Falls back to 0.5 (neutral) on cold-start or when implicit is unavailable.
+        """
+        if not user_interactions or not _ALS_AVAILABLE:
+            return 0.5
+
+        user_item_matrix = self._build_user_item_matrix(user_interactions)
+        als_result = self._build_als_model(user_item_matrix)
+        if als_result is None:
+            return 0.5
+
+        model, user2idx, idx2user, item2idx, idx2item = als_result
+        candidate_id = str(item.get("id", ""))
+
+        if candidate_id not in item2idx:
+            return 0.5  # cold-start
+        if user_id not in user2idx:
+            return 0.5  # new user with no ALS vector yet
+
+        user_idx = user2idx[user_id]
+        item_idx = item2idx[candidate_id]
+
+        # user_factors: shape (n_users, factors)   item_factors: shape (n_items, factors)
+        p_u = model.user_factors[user_idx]   # latent preference vector
+        q_i = model.item_factors[item_idx]   # latent item attribute vector
+
+        dot = float(np.dot(p_u, q_i))
+
+        # Sigmoid maps (-∞, +∞) → (0, 1) smoothly
+        sigmoid = 1.0 / (1.0 + np.exp(-dot))
+        return float(np.clip(sigmoid, 0.0, 1.0))
 
     def _calculate_diversity_score(self, item: Dict, selected_items: List[Dict]) -> float:
         if not selected_items:
