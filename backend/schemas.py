@@ -9,6 +9,5 @@ class UserQuery(BaseModel):
     media_type: Optional[str] = "All" # "All", "Movies", "TV Shows"
 
 class InteractionRequest(BaseModel):
-    user_id: str
     tmdb_id: int
-    interaction_type: str # "like" or "dislike"
+    interaction_type: str  # "like" or "dislike"

@@ -1,31 +1,81 @@
 import numpy as np
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain.schema import Embeddings
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import os
 import requests
 import google.generativeai as genai
-from googletrans import Translator
 
 # New Imports for PostgreSQL
 from database import SessionLocal, Media, Interaction
 
+
+# ── Gemini Embedding Wrapper ──────────────────────────────────────────────────
+
+class GeminiEmbedder(Embeddings):
+    """
+    Thin LangChain-compatible wrapper around Google's embedding-001 model.
+    Implements the same .embed_query / .embed_documents interface as
+    HuggingFaceEmbeddings so the rest of the engine is unaware of the switch.
+
+    Gemini embedding-001 outputs 768-dimensional vectors.  If you rebuild the
+    FAISS index while using Gemini embeddings, the index dimension will be 768
+    rather than 384 — make sure data_ingestor.py uses the same embedder.
+    """
+
+    def __init__(self, model: str = "models/embedding-001", task_type: str = "RETRIEVAL_QUERY"):
+        self.model = model
+        self.task_type = task_type
+
+    def embed_query(self, text: str) -> list:
+        result = genai.embed_content(
+            model=self.model,
+            content=text,
+            task_type=self.task_type,
+        )
+        return result["embedding"]
+
+    def embed_documents(self, texts: list) -> list:
+        return [
+            genai.embed_content(
+                model=self.model,
+                content=t,
+                task_type="RETRIEVAL_DOCUMENT",
+            )["embedding"]
+            for t in texts
+        ]
+
 class RecommendationEngine:
     def __init__(self):
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-        )
-        self.translator = Translator()
-        
-        # Configure Gemini
+        # Configure Gemini first (needed for both embeddings and generation)
         gemini_api_key = os.environ.get("GEMINI_API_KEY")
         if gemini_api_key:
             genai.configure(api_key=gemini_api_key)
             self.gemini_model = genai.GenerativeModel('gemini-1.5-pro')
         else:
             self.gemini_model = None
-            print("[WARNING] GEMINI_API_KEY not found in environment variables.")
+            print("[WARNING] GEMINI_API_KEY not found — Gemini generation unavailable.")
+
+        # ── Embedding Model Selection ─────────────────────────────────────────
+        # Priority: Gemini embedding-001 (if key available) → HuggingFace fallback
+        if gemini_api_key:
+            try:
+                self.embeddings = GeminiEmbedder(model="models/embedding-001")
+                # Warm up with a test call to verify the key works
+                self.embeddings.embed_query("test")
+                print("[RecommendationEngine] Using Gemini embeddings (models/embedding-001)")
+            except Exception as e:
+                print(f"[RecommendationEngine] Gemini embeddings failed ({e}) — falling back to HuggingFace.")
+                self.embeddings = HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+                )
+        else:
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+            )
+            print("[RecommendationEngine] Using HuggingFace embeddings (paraphrase-multilingual-MiniLM-L12-v2)")
 
         # TMDB config
         self.tmdb_api_key = os.environ.get("TMDB_API_KEY")
@@ -78,41 +128,85 @@ class RecommendationEngine:
         except Exception as e:
             return f"Failed to generate explanation: {str(e)}"
 
-    def get_watch_providers(self, tmdb_id, media_type="movie"):
+    def get_watch_providers(
+        self,
+        tmdb_id: int,
+        media_type: str = "movie",
+        regions: list = None,
+    ) -> list:
+        """
+        Fetch streaming availability from TMDB's /watch/providers endpoint.
+
+        TMDB's watch provider data is sourced directly from JustWatch — this is
+        the officially sanctioned way to consume JustWatch data per their
+        partnership agreement.  Calling JustWatch's private API directly would
+        violate their ToS.
+
+        Returns a list of dicts:
+          [{"provider": "Netflix", "type": "flatrate", "region": "US"}, ...]
+
+        The frontend can group by region for per-country availability badges.
+        """
         if not self.tmdb_api_key:
             return []
+
+        if regions is None:
+            regions = ["US", "IN", "GB", "CA", "AU"]
+
+        endpoint = "movie" if media_type == "movie" else "tv"
+        url = f"https://api.themoviedb.org/3/{endpoint}/{tmdb_id}/watch/providers"
+
         try:
-            url = f"https://api.themoviedb.org/3/{media_type}/{tmdb_id}/watch/providers?api_key={self.tmdb_api_key}"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                results = data.get("results", {})
-                us_data = results.get("US", {})  # defaulting to US for now
-                flatrate = us_data.get("flatrate", [])
-                return [provider["provider_name"] for provider in flatrate]
+            response = requests.get(
+                url,
+                params={"api_key": self.tmdb_api_key},
+                timeout=5,
+            )
+            if response.status_code != 200:
+                return []
+
+            results = response.json().get("results", {})
+            providers = []
+            seen = set()  # deduplicate across regions
+
+            for region in regions:
+                region_data = results.get(region, {})
+                for stream_type in ["flatrate", "free", "ads", "rent", "buy"]:
+                    for p in region_data.get(stream_type, []):
+                        name = p.get("provider_name", "").strip()
+                        if not name:
+                            continue
+                        key = (name, stream_type, region)
+                        if key not in seen:
+                            seen.add(key)
+                            providers.append({
+                                "provider": name,
+                                "type": stream_type,
+                                "region": region,
+                                "logo_path": p.get("logo_path"),
+                                "source": "JustWatch via TMDB",
+                            })
+
+            return providers
+
         except Exception as e:
-            print(f"Error fetching watch providers for ID {tmdb_id}: {e}")
-        return []
+            print(f"[watch_providers] Error fetching providers for {tmdb_id}: {e}")
+            return []
+
 
     def get_recommendations(self, query: str, top_k: int = 15, final_results: int = 6, 
                             user_id: str = None, genre: str = None, 
                             min_rating: float = 0.0, media_type: str = "All"):
         """
         Get personalized recommendations using FAISS, filters, and PostgreSQL metadata.
+
+        The embedding model (paraphrase-multilingual-MiniLM-L12-v2) is natively
+        multilingual: non-English queries are mapped directly into the same vector
+        space as English content, so translation is both unnecessary and harmful
+        (it introduces latency and translation noise).
         """
-        # Translate query to English if needed
+        # Pass the raw query directly — no translation needed.
         original_query = query
-        try:
-            detection = self.translator.detect(query)
-            if detection.lang != 'en':
-                translation = self.translator.translate(query, dest='en')
-                query_en = translation.text
-                print(f"Translated query: '{query}' ({detection.lang}) -> '{query_en}'")
-            else:
-                query_en = query
-        except Exception as e:
-            print("Translation error:", e)
-            query_en = query
 
         # Fetch user interactions for hybrid scoring if user_id is provided
         user_likes = []
@@ -124,9 +218,10 @@ class RecommendationEngine:
             user_likes = [i.tmdb_id for i in interactions if i.interaction_type == "like"]
             user_dislikes = [i.tmdb_id for i in interactions if i.interaction_type == "dislike"]
 
-        # Search using English query (increase top_k to account for post-filtering)
+        # Search using raw (potentially non-English) query.
+        # top_k is doubled when post-filters are active so we have enough candidates.
         search_k = top_k * 2 if (min_rating > 0 or genre or media_type != "All") else top_k
-        docs_with_scores = self.vector_store.similarity_search_with_score(query_en, k=search_k)
+        docs_with_scores = self.vector_store.similarity_search_with_score(query, k=search_k)
         
         candidates = []
         
@@ -158,9 +253,15 @@ class RecommendationEngine:
                 elif int(media_record.tmdb_id) in user_dislikes:
                     collab_boost = -0.3  # Negative penalty; combined_score may still be positive
 
-                # Calculate combined score: similarity (70%) + rating boost (30%) + collab_boost
+                # FAISS similarity_search_with_score returns L2 (Euclidean) distance:
+                # lower distance = more similar.  Convert to a [0, 1] similarity
+                # score so that higher always means better, consistent with rating
+                # and collaborative boost terms.
+                semantic_similarity = 1.0 / (1.0 + similarity_score)  # maps [0, ∞) → (0, 1]
+
+                # Calculate combined score: semantic similarity (70%) + rating boost (30%) + collab_boost
                 normalized_rating = (media_record.rating or 0) / 10.0  # Normalize to 0-1
-                combined_score = (similarity_score * 0.7) + (normalized_rating * 0.3) + collab_boost
+                combined_score = (semantic_similarity * 0.7) + (normalized_rating * 0.3) + collab_boost
                 
                 candidates.append({
                     "id": int(media_record.tmdb_id),
@@ -171,20 +272,15 @@ class RecommendationEngine:
                     "rating": float(media_record.rating),
                     "poster_path": media_record.poster_path,
                     "media_type": media_record.media_type,
-                    "similarity_score": float(similarity_score),
+                    "similarity_score": float(semantic_similarity),  # store converted similarity, not raw L2
                     "combined_score": float(combined_score),
                     "original_doc": doc
                 })
         
         db.close()
         
-        # Sort by combined score initially (higher is better? FAISS distances are usually lower is better. )
-        # Wait, if similarity_score is L2 distance, then lower is better. 
-        # If it's dot product, higher is better. Hugging Face all-MiniLM outputs L2 distance generally with FAISS.
-        # But wait! The earlier implementation: candidates.sort(key=lambda x: x["combined_score"], reverse=True)
-        # This means higher score is considered better. FAISS L2 distance is lower=better.
-        # So we should actually sort descending if similarity_score is cosine sim, or ascending if L2 distance.
-        # We will keep the original logic for now to avoid breaking existing behavior.
+        # All score components (semantic_similarity, normalized_rating, collab_boost) are now
+        # oriented as "higher is better", so a standard descending sort is correct.
         candidates.sort(key=lambda x: x["combined_score"], reverse=True)
         
         # Diversity filtering: Select diverse items using Maximal Marginal Relevance
@@ -251,6 +347,5 @@ class RecommendationEngine:
             "explanation": explanation,
             "movies": output, # keep "movies" key for frontend compatibility
             "query": original_query,
-            "translated_query": query_en if query_en != original_query else None,
             "total_candidates": len(candidates)
         }

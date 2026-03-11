@@ -217,3 +217,60 @@ def dispatch_update_providers(tmdb_ids: list):
         update_provider_cache_task.delay(tmdb_ids)  # type: ignore[union-attr]
     else:
         _do_update_providers(tmdb_ids)
+
+
+# ── Task: Data Ingestion (FAISS index rebuild) ────────────────────────────────
+
+def _do_ingest_data():
+    """
+    Core ingestion logic — rebuilds the FAISS vector index from CSV data.
+    Shared by the Celery task and the inline BackgroundTasks fallback.
+    """
+    try:
+        import sys
+        import os
+        # Ensure the backend directory is on sys.path when run as a task
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+        if backend_dir not in sys.path:
+            sys.path.insert(0, backend_dir)
+
+        from data_ingestor import DataIngestor
+        print(f"[tasks] Starting FAISS data ingestion at {datetime.utcnow().isoformat()}")
+        ingestor = DataIngestor()
+        ingestor.create_faiss_index()
+        print(f"[tasks] Data ingestion complete at {datetime.utcnow().isoformat()}")
+    except Exception as e:
+        print(f"[tasks] Data ingestion error: {e}")
+        raise
+
+
+if CELERY_AVAILABLE and celery_app is not None:
+    @celery_app.task(name="tasks.ingest_data", bind=True, max_retries=1, default_retry_delay=120, time_limit=3600)
+    def ingest_data_task(self):
+        """
+        Celery task: rebuild the FAISS index in the background.
+
+        time_limit=3600 gives the worker up to 1 hour — embedding generation
+        for thousands of documents is CPU-intensive.
+        """
+        try:
+            _do_ingest_data()
+        except Exception as exc:
+            raise self.retry(exc=exc)
+else:
+    def ingest_data_task():  # type: ignore[misc]
+        """Fallback stub when Celery is not available."""
+        _do_ingest_data()
+
+
+def dispatch_ingest_data():
+    """
+    Call from FastAPI: dispatch ingestion via Celery if the broker is reachable,
+    otherwise run inline (will block the calling thread — use with BackgroundTasks).
+    """
+    if _is_celery_ready():
+        ingest_data_task.delay()  # type: ignore[union-attr]
+        print("[tasks] Ingestion dispatched to Celery worker.")
+    else:
+        print("[tasks] Celery unavailable — running ingestion inline.")
+        _do_ingest_data()

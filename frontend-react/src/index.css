@@ -7,3 +7,63 @@
     @apply bg-slate-900 text-slate-100;
   }
 }
+
+/* ── AI Explanation Box ──────────────────────────────────────────────────────
+   Mobile-first responsive container for Gemini / react-markdown output.
+   The .ai-markdown overrides ensure bold, links, and paragraphs all render
+   correctly on a dark background without any default prose colours leaking in.
+─────────────────────────────────────────────────────────────────────────── */
+@layer components {
+  .ai-box-wrapper {
+    @apply w-full;
+  }
+
+  .ai-box {
+    @apply w-full border-l-2 border-blue-500/60 bg-slate-900/70 backdrop-blur-sm rounded-r-xl shadow-lg p-4 sm:p-6;
+  }
+
+  /* Markdown content rendered inside the AI box */
+  .ai-markdown {
+    @apply text-slate-300 leading-relaxed text-sm sm:text-base;
+  }
+
+  /* react-markdown renders paragraphs as <p> tags */
+  .ai-markdown p {
+    @apply mb-3 last:mb-0;
+  }
+
+  /* Bold / strong — Gemini wraps thematic keywords in **double stars** */
+  .ai-markdown strong,
+  .ai-markdown b {
+    @apply text-blue-300 font-semibold;
+  }
+
+  /* Italic emphasis */
+  .ai-markdown em {
+    @apply text-slate-200 italic;
+  }
+
+  /* Inline code */
+  .ai-markdown code {
+    @apply bg-slate-800 text-blue-300 px-1 py-0.5 rounded text-sm font-mono;
+  }
+
+  /* Links */
+  .ai-markdown a {
+    @apply text-blue-400 underline underline-offset-2 hover:text-blue-300 transition-colors;
+  }
+
+  /* Lists */
+  .ai-markdown ul,
+  .ai-markdown ol {
+    @apply pl-5 mb-3 space-y-1;
+  }
+
+  .ai-markdown ul {
+    @apply list-disc;
+  }
+
+  .ai-markdown ol {
+    @apply list-decimal;
+  }
+}

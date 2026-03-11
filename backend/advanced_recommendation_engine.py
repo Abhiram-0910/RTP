@@ -1,9 +1,16 @@
+import hashlib
+import logging
+import warnings
+
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 class AdvancedRecommendationEngine:
@@ -201,14 +208,68 @@ class AdvancedRecommendationEngine:
             try:
                 vec = self.embeddings_model.embed_query(text)
                 return np.array(vec, dtype=np.float32)
-            except Exception:
-                pass
+            except Exception as model_exc:
+                warnings.warn(
+                    f"[AdvancedRecommendationEngine] Primary embedding model failed for item "
+                    f"'{item.get('title', 'unknown')}': {model_exc}. "
+                    "Falling back to TF-IDF projection.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                logger.warning(
+                    "Embedding model error for item '%s': %s — using TF-IDF fallback.",
+                    item.get("title", "unknown"),
+                    model_exc,
+                )
 
-        # Fallback: return a zero vector when no embedding model is available.
-        # A zero vector contributes 0.0 to cosine similarity scores (neutral/no signal),
-        # which is far safer than a random or hash-based pseudo-embedding that would
-        # corrupt similarity ranking results unpredictably.
-        return np.zeros(384, dtype=np.float32)
+        # ── TF-IDF fallback ────────────────────────────────────────────────────
+        # A zero vector is *never* used: cosine_similarity(zeros, x) = 0 for all x,
+        # which silently collapses every fallback item to the same score and
+        # destroys ranking quality.
+        #
+        # Instead, build a deterministic, unit-normalised representation:
+        #   1. Fit a char-level TF-IDF on the item text.
+        #   2. Project the sparse vector into 384 dims via TruncatedSVD.
+        #   3. If the text is too short for SVD, fall back to a seeded
+        #      pseudo-random unit vector that is at least *unique* per item.
+        if not text.strip():
+            # Absolute last resort: deterministic unit vector seeded on title hash.
+            seed = int(hashlib.md5(item.get("title", "unknown").encode()).hexdigest(), 16) % (2 ** 32)
+            rng = np.random.default_rng(seed)
+            vec = rng.standard_normal(384).astype(np.float32)
+            norm = np.linalg.norm(vec)
+            return vec / norm if norm > 0 else vec
+
+        dim = 384
+        try:
+            vectorizer = TfidfVectorizer(
+                analyzer="char_wb", ngram_range=(3, 5), max_features=min(2000, max(dim * 4, 1))
+            )
+            sparse_matrix = vectorizer.fit_transform([text])
+            n_features = sparse_matrix.shape[1]
+            n_components = min(dim, n_features - 1)  # SVD requires n_components < n_features
+
+            if n_components > 0:
+                svd = TruncatedSVD(n_components=n_components, random_state=42)
+                dense = svd.fit_transform(sparse_matrix)[0].astype(np.float32)
+                # Pad to 384 dims if n_components < dim
+                if len(dense) < dim:
+                    dense = np.pad(dense, (0, dim - len(dense)))
+            else:
+                raise ValueError("Not enough TF-IDF features for SVD projection.")
+        except Exception as tfidf_exc:
+            warnings.warn(
+                f"[AdvancedRecommendationEngine] TF-IDF fallback also failed: {tfidf_exc}. "
+                "Using seeded pseudo-random unit vector.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            seed = int(hashlib.md5(text[:256].encode()).hexdigest(), 16) % (2 ** 32)
+            rng = np.random.default_rng(seed)
+            dense = rng.standard_normal(dim).astype(np.float32)
+
+        norm = np.linalg.norm(dense)
+        return dense / norm if norm > 0 else dense
 
     def _calculate_quality_boost(self, item: Dict) -> float:
         quality_score = 0.0
