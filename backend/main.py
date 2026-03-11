@@ -3,16 +3,17 @@ main.py — FastAPI entry-point for Movie & TV Recommendation Engine.
 
 Security
 --------
-- /token           : OAuth2 password flow (issues JWT)
-- /api/rate        : requires valid JWT bearer token; user_id sourced from token
+- /token           : OAuth2 password flow (issues access + refresh JWT pair)
+- /api/register    : create a new user account
+- /api/refresh     : exchange refresh token for a new token pair
+- /api/rate        : requires valid JWT bearer token; user_id from token
 - /api/recommend   : open (public query), cached in Redis when available
 - /api/ingest      : admin-only, enqueues data-ingestion Celery task
 
 Caching
 -------
 Redis is used when REDIS_URL is set (or Redis is reachable at localhost:6379).
-Falls back silently to no-cache if Redis is unavailable — the API never errors
-because of a missing cache layer.
+Falls back silently to no-cache if Redis is unavailable.
 """
 
 import hashlib
@@ -24,18 +25,14 @@ from typing import Optional
 import redis
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
 from auth import (
     Token,
-    authenticate_user,
-    create_access_token,
     get_current_user,
     require_admin,
     router as auth_router,
-    ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from datetime import timedelta
 from database import get_db, Interaction, init_db
@@ -122,23 +119,8 @@ def _cache_key(request: UserQuery) -> str:
 
 
 # ── Auth Endpoints ─────────────────────────────────────────────────────────────
-# /token is provided by auth_router. Expose it at root level too for OpenAPI docs.
-
-@app.post("/token", response_model=Token, tags=["auth"], include_in_schema=False)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    """Shadow route — the real implementation is on auth_router."""
-    user = authenticate_user(form_data.username, form_data.password)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    token = create_access_token(
-        data={"sub": user["username"], "role": user["role"]},
-        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-    )
-    return Token(access_token=token, token_type="bearer", expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
+# /token, /api/register, and /api/refresh are all provided by auth_router.
+# No shadow routes needed here — auth_router is already included above.
 
 
 # ── Recommendation Endpoint (cached, public) ──────────────────────────────────
