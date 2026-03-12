@@ -291,27 +291,34 @@ class RecommendationEngine:
         regions: list = None,
     ) -> list:
         """
-        Fetch streaming availability from TMDB's /watch/providers endpoint,
-        with a **24-hour Redis cache layer** to avoid repeated live HTTP calls
-        for every movie in a results page.
+        Fetch streaming availability from TMDB's /watch/providers endpoint with a
+        **per-region Redis cache layer** (24-hour TTL).
 
         Cache key schema
         ----------------
-        ``providers:{media_type}:{tmdb_id}:{sorted_regions_csv}``
-        e.g. ``providers:movie:550:AU,CA,GB,IN,US``
+        One key **per region**:  ``providers:{media_type}:{tmdb_id}:{REGION}``
+        e.g. ``providers:movie:550:US``, ``providers:movie:550:IN``
 
-        The sorted region list is used so that callers passing the same regions
-        in different order share the same cache entry.
+        Why per-region?
+        ~~~~~~~~~~~~~~~
+        A combined key (e.g. ``providers:movie:550:AU,CA,GB,IN,US``) causes a
+        cache miss whenever the caller requests any different subset of regions.
+        Per-region keys mean the Celery pre-warm can populate every region
+        independently and any caller subset gets full hits.
+
+        Request flow
+        ------------
+        1. ``mget`` all per-region keys in a single Redis round-trip.
+        2. Regions with a cache hit are deserialised immediately — zero TMDB calls.
+        3. Missing regions trigger a **single live TMDB call** (one HTTP request
+           always returns all regions at once; we just cherry-pick what we need).
+        4. Each newly fetched region is written back with ``SETEX`` (24 h TTL).
+        5. Cached + live providers are merged and returned.
 
         Redis unavailability
         --------------------
-        If Redis is offline or returns an error the method falls through to a
-        live TMDB call and returns the result without caching — no exception
-        is raised and the user never notices.
-
-        TMDB's watch provider data is sourced directly from JustWatch — this is
-        the officially sanctioned integration per their partnership agreement.
-        Calling JustWatch's private API directly would violate their ToS.
+        If Redis is offline every region falls through to the live TMDB call and
+        the result is returned uncached — no exception is raised.
 
         Returns
         -------
@@ -324,23 +331,42 @@ class RecommendationEngine:
         if regions is None:
             regions = ["US", "IN", "GB", "CA", "AU"]
 
-        # ── 1. Build deterministic cache key ────────────────────────────────────────────────
-        regions_key = ",".join(sorted(regions))
-        cache_key = f"providers:{media_type}:{tmdb_id}:{regions_key}"
-        _PROVIDER_TTL = 86_400  # 24 hours in seconds
+        _PROVIDER_TTL = 86_400   # 24 hours
 
-        # ── 2. Cache read (Redis hit) ────────────────────────────────────────────────────────
+        # ── 1. One cache key per region ─────────────────────────────────────────
+        region_keys = {
+            region: f"providers:{media_type}:{tmdb_id}:{region}"
+            for region in regions
+        }
+
+        # ── 2. mget — single Redis round-trip for all regions ───────────────────
+        providers_out: list = []
+        missing_regions: list = list(regions)
+
         rc = _get_redis_client()
         if rc is not None:
             try:
-                cached_raw = rc.get(cache_key)
-                if cached_raw:
-                    return json.loads(cached_raw)
-            except Exception as cache_read_exc:
-                # Redis read error — log and proceed to live call
-                print(f"[WatchProviders Cache] Read error for {cache_key}: {cache_read_exc}")
+                keys_ordered = [region_keys[r] for r in regions]
+                cached_values = rc.mget(keys_ordered)
 
-        # ── 3. Cache miss — fetch live from TMDB ─────────────────────────────────────────────
+                missing_regions = []
+                for region, raw in zip(regions, cached_values):
+                    if raw:
+                        providers_out.extend(json.loads(raw))
+                    else:
+                        missing_regions.append(region)
+
+                if not missing_regions:
+                    return providers_out   # full cache hit
+
+            except Exception as mget_exc:
+                print(f"[WatchProviders Cache] mget error for {tmdb_id}: {mget_exc}")
+                missing_regions = list(regions)
+
+        # ── 3. Single TMDB call for all missing regions ─────────────────────────
+        if not missing_regions:
+            return providers_out
+
         endpoint = "movie" if media_type == "movie" else "tv"
         url = f"https://api.themoviedb.org/3/{endpoint}/{tmdb_id}/watch/providers"
 
@@ -351,42 +377,53 @@ class RecommendationEngine:
                 timeout=5,
             )
             if response.status_code != 200:
-                return []
+                return providers_out
 
             results = response.json().get("results", {})
-            providers = []
-            seen = set()  # deduplicate across regions
 
-            for region in regions:
+            # ── 4. Parse and write each missing region to its own cache key ─────
+            for region in missing_regions:
                 region_data = results.get(region, {})
+                region_providers: list = []
+                seen: set = set()
+
                 for stream_type in ["flatrate", "free", "ads", "rent", "buy"]:
                     for p in region_data.get(stream_type, []):
                         name = p.get("provider_name", "").strip()
                         if not name:
                             continue
-                        key = (name, stream_type, region)
+                        key = (name, stream_type)
                         if key not in seen:
                             seen.add(key)
-                            providers.append({
-                                "provider": name,
-                                "type": stream_type,
-                                "region": region,
+                            region_providers.append({
+                                "provider":  name,
+                                "type":      stream_type,
+                                "region":    region,
                                 "logo_path": p.get("logo_path"),
-                                "source": "JustWatch via TMDB",
+                                "source":    "JustWatch via TMDB",
                             })
 
-            # ── 4. Cache write (Redis set with TTL) ─────────────────────────────────────────
-            if rc is not None:
-                try:
-                    rc.setex(cache_key, _PROVIDER_TTL, json.dumps(providers))
-                except Exception as cache_write_exc:
-                    print(f"[WatchProviders Cache] Write error for {cache_key}: {cache_write_exc}")
+                if rc is not None:
+                    try:
+                        rc.setex(
+                            region_keys[region],
+                            _PROVIDER_TTL,
+                            json.dumps(region_providers),
+                        )
+                    except Exception as write_exc:
+                        print(
+                            f"[WatchProviders Cache] Write error "
+                            f"for {region_keys[region]}: {write_exc}"
+                        )
 
-            return providers
+                providers_out.extend(region_providers)
+
+            return providers_out
 
         except Exception as e:
             print(f"[watch_providers] Error fetching providers for {tmdb_id}: {e}")
-            return []
+            return providers_out
+
 
 
     # ── Similarity Search Backends ──────────────────────────────────────────────

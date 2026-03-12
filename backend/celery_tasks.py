@@ -307,20 +307,24 @@ def update_trending_and_providers(self) -> dict[str, Any]:
             if resp.status_code != 200:
                 continue
 
-            results   = resp.json().get("results", {})
-            providers = []
-            seen: set = set()
+            results = resp.json().get("results", {})
+
+            # Write ONE cache key per region so any subset requested by the
+            # frontend gets a full hit (matches get_watch_providers mget logic).
             for region in _DEFAULT_REGIONS:
                 region_data = results.get(region, {})
+                region_providers: list = []
+                seen: set = set()
+
                 for stream_type in ("flatrate", "free", "ads", "rent", "buy"):
                     for p in region_data.get(stream_type, []):
                         name = p.get("provider_name", "").strip()
                         if not name:
                             continue
-                        key = (name, stream_type, region)
+                        key = (name, stream_type)
                         if key not in seen:
                             seen.add(key)
-                            providers.append({
+                            region_providers.append({
                                 "provider":   name,
                                 "type":       stream_type,
                                 "region":     region,
@@ -328,16 +332,20 @@ def update_trending_and_providers(self) -> dict[str, Any]:
                                 "source":     "JustWatch via TMDB",
                             })
 
-            if rc is not None:
-                regions_key = ",".join(sorted(_DEFAULT_REGIONS))
-                cache_key   = f"providers:{media_type}:{tmdb_id}:{regions_key}"
-                rc.setex(cache_key, _PROVIDER_TTL, json.dumps(providers))
+                if rc is not None:
+                    cache_key = f"providers:{media_type}:{tmdb_id}:{region}"
+                    try:
+                        rc.setex(cache_key, _PROVIDER_TTL, json.dumps(region_providers))
+                    except Exception as w_exc:
+                        logger.warning("Cache write failed for %s: %s", cache_key, w_exc)
+
             stats["cache_warmed"] += 1
 
         except Exception as warm_exc:
             logger.warning("Pre-warm failed for tmdb_id=%s: %s", tmdb_id, warm_exc)
 
-    logger.info("[Phase 3] Pre-warmed %d provider cache entries.", stats["cache_warmed"])
+    logger.info("[Phase 3] Pre-warmed %d titles (%d regions each).", stats["cache_warmed"], len(_DEFAULT_REGIONS))
+
 
     # ── Summary ───────────────────────────────────────────────────────────────
     stats["finished_at"] = datetime.now(timezone.utc).isoformat()
