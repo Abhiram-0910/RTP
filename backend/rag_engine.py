@@ -2,54 +2,82 @@ import numpy as np
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import os
 import json
 import requests
 import google.generativeai as genai
+from typing import Callable, Any
 
 # Database imports — pgvector search uses SQLAlchemy directly
 from database import SessionLocal, Media, Interaction, MediaEmbedding, PGVECTOR_AVAILABLE
 from sqlalchemy import text as sa_text
 
 
-# ── Redis singleton for watch-provider caching ────────────────────────────────────────────────
-# The connection is created once at import time (lazy).  If Redis is unreachable
-# (offline, wrong URL, etc.) the helper returns None and every cache call is a
-# no-op — the engine degrades gracefully to live TMDB calls with zero exceptions.
+# ── Redis ConnectionPool & Resiliency Wrapper ─────────────────────────────────
+# Connections are borrowed per-call from a robust pool instead of a brittle
+# single global client.
 
-_redis_client = None
+_redis_pool = None
 _redis_initialised = False
 
 
-def _get_redis_client():
-    """
-    Return a connected ``redis.Redis`` instance, or ``None`` if Redis is 
-    unavailable.  The module-level ``_redis_client`` is initialised exactly
-    once and then reused for every subsequent call (connection pooling).
-    """
-    global _redis_client, _redis_initialised
+def _init_redis_pool():
+    global _redis_pool, _redis_initialised
     if _redis_initialised:
-        return _redis_client
+        return
 
     _redis_initialised = True
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     try:
         import redis as _redis_lib
-        client = _redis_lib.from_url(redis_url, socket_connect_timeout=2, socket_timeout=2)
-        client.ping()  # fail-fast: confirms the connection is actually alive
-        _redis_client = client
-        print(f"[WatchProviders Cache] Redis connected at {redis_url}")
+        _redis_pool = _redis_lib.ConnectionPool.from_url(
+            redis_url, 
+            socket_connect_timeout=2, 
+            socket_timeout=2, 
+            max_connections=10,
+            decode_responses=False
+        )
+        # Verify connection
+        client = _redis_lib.Redis(connection_pool=_redis_pool)
+        client.ping()
+        print(f"[WatchProviders Cache] Redis ConnectionPool active at {redis_url}")
     except Exception as exc:
-        _redis_client = None
+        _redis_pool = None
         print(f"[WatchProviders Cache] Redis unavailable ({exc}) — caching disabled.")
-    return _redis_client
+
+
+def _get_redis_client():
+    if _redis_pool is None:
+        return None
+    import redis as _redis_lib
+    return _redis_lib.Redis(connection_pool=_redis_pool)
+
+
+def _redis_safe_call(operation: Callable[[Any], Any], fallback: Any = None) -> Any:
+    """
+    Execute a Redis operation with auto-reconnect/failover protection.
+    If a ConnectionError or TimeoutError occurs, it degrades gracefully
+    without throwing a 500 error.
+    """
+    client = _get_redis_client()
+    if not client:
+        return fallback
+
+    import redis as _redis_lib
+    try:
+        return operation(client)
+    except (_redis_lib.ConnectionError, _redis_lib.TimeoutError) as exc:
+        print(f"[Redis Wrapper] Connection lost/timeout during cache op: {exc}")
+        return fallback
+    except Exception as exc:
+        print(f"[Redis Wrapper] Unexpected error during cache op: {exc}")
+        return fallback
 
 
 # Initialise eagerly so the status message appears at startup alongside other
 # backend readiness checks rather than on the first user request.
-_get_redis_client()
+_init_redis_pool()
 
 
 # ── Gemini Embedding Wrapper ──────────────────────────────────────────────────
@@ -384,25 +412,21 @@ class RecommendationEngine:
         providers_out: list = []
         missing_regions: list = list(regions)
 
-        rc = _get_redis_client()
-        if rc is not None:
-            try:
-                keys_ordered = [region_keys[r] for r in regions]
-                cached_values = rc.mget(keys_ordered)
+        keys_ordered = [region_keys[r] for r in regions]
 
-                missing_regions = []
-                for region, raw in zip(regions, cached_values):
-                    if raw:
-                        providers_out.extend(json.loads(raw))
-                    else:
-                        missing_regions.append(region)
+        # Safe wrapper around mget
+        cached_values = _redis_safe_call(lambda rc: rc.mget(keys_ordered))
 
-                if not missing_regions:
-                    return providers_out   # full cache hit
+        if cached_values is not None:
+            missing_regions = []
+            for region, raw in zip(regions, cached_values):
+                if raw:
+                    providers_out.extend(json.loads(raw))
+                else:
+                    missing_regions.append(region)
 
-            except Exception as mget_exc:
-                print(f"[WatchProviders Cache] mget error for {tmdb_id}: {mget_exc}")
-                missing_regions = list(regions)
+            if not missing_regions:
+                return providers_out   # full cache hit
 
         # ── 3. Single TMDB call for all missing regions ─────────────────────────
         if not missing_regions:
@@ -444,18 +468,13 @@ class RecommendationEngine:
                                 "source":    "JustWatch via TMDB",
                             })
 
-                if rc is not None:
-                    try:
-                        rc.setex(
-                            region_keys[region],
-                            _PROVIDER_TTL,
-                            json.dumps(region_providers),
-                        )
-                    except Exception as write_exc:
-                        print(
-                            f"[WatchProviders Cache] Write error "
-                            f"for {region_keys[region]}: {write_exc}"
-                        )
+                _redis_safe_call(
+                    lambda rc, r=region, rp=region_providers: rc.setex(
+                        region_keys[r],
+                        _PROVIDER_TTL,
+                        json.dumps(rp),
+                    )
+                )
 
                 providers_out.extend(region_providers)
 
@@ -520,39 +539,49 @@ class RecommendationEngine:
             WHERE m.rating >= :min_rating
             {media_type_filter}
             ORDER BY cosine_dist ASC
-            LIMIT :top_k
+            LIMIT :search_k
         """)
 
-        rows = db.execute(sql, {"vec": vec_literal, "min_rating": min_rating, "top_k": top_k}).fetchall()
+        search_k = top_k * 5
+        rows = db.execute(sql, {"vec": vec_literal, "min_rating": min_rating, "search_k": search_k}).fetchall()
 
-        candidates = []
+        grouped_candidates = {}
         for row in rows:
+            tmdb_id = int(row.tmdb_id)
             cosine_dist = float(row.cosine_dist)          # [0, 2]; 0 = identical
             cosine_sim   = 1.0 - (cosine_dist / 2.0)      # map to [0, 1]; 1 = identical
 
+            if tmdb_id in grouped_candidates:
+                if cosine_sim > grouped_candidates[tmdb_id]["similarity_score"]:
+                    grouped_candidates[tmdb_id]["similarity_score"] = cosine_sim
+            else:
+                grouped_candidates[tmdb_id] = {
+                    "id": tmdb_id,
+                    "db_id": int(row.db_id),
+                    "title": row.title,
+                    "overview": row.overview,
+                    "release_date": row.release_date,
+                    "rating": float(row.rating or 0),
+                    "poster_path": row.poster_path,
+                    "media_type": row.emb_media_type,
+                    "similarity_score": cosine_sim,
+                    "combined_score": 0.0,
+                    "original_doc": None,
+                }
+
+        candidates = list(grouped_candidates.values())
+        for cand in candidates:
             collab_boost = 0.0
-            if int(row.tmdb_id) in user_likes:
+            if cand["id"] in user_likes:
                 collab_boost = 0.2
-            elif int(row.tmdb_id) in user_dislikes:
+            elif cand["id"] in user_dislikes:
                 collab_boost = -0.3
 
-            normalized_rating = (float(row.rating or 0)) / 10.0
-            combined_score = (cosine_sim * 0.7) + (normalized_rating * 0.3) + collab_boost
+            normalized_rating = cand["rating"] / 10.0
+            cand["combined_score"] = (cand["similarity_score"] * 0.7) + (normalized_rating * 0.3) + collab_boost
 
-            candidates.append({
-                "id": int(row.tmdb_id),
-                "db_id": int(row.db_id),
-                "title": row.title,
-                "overview": row.overview,
-                "release_date": row.release_date,
-                "rating": float(row.rating or 0),
-                "poster_path": row.poster_path,
-                "media_type": row.emb_media_type,
-                "similarity_score": float(cosine_sim),
-                "combined_score": float(combined_score),
-                "original_doc": None,  # not applicable for pgvector path
-            })
-
+        # Sort by combined target and slice
+        candidates = sorted(candidates, key=lambda x: x["similarity_score"], reverse=True)[:top_k]
         return candidates
 
     def _faiss_search(
@@ -574,7 +603,7 @@ class RecommendationEngine:
         if self.vector_store is None:
             raise RuntimeError("FAISS index not loaded and pgvector is disabled. Cannot search.")
 
-        search_k = top_k * 2 if (min_rating > 0 or genre or media_type != "All") else top_k
+        search_k = top_k * 5 if (min_rating > 0 or genre or media_type != "All") else top_k * 3
 
         # Use the dimension-safe embedding path
         query_vec = self._safe_embed(query)
@@ -582,7 +611,7 @@ class RecommendationEngine:
             query_vec, k=search_k
         )
 
-        candidates = []
+        grouped_candidates = {}
         for doc, similarity_score in docs_with_scores:
             tmdb_id = doc.metadata.get("id")
             doc_media_type = doc.metadata.get("media_type", "movie")
@@ -590,40 +619,50 @@ class RecommendationEngine:
             if media_type != "All" and doc_media_type != media_type.lower().replace(" shows", ""):
                 continue
 
-            media_record = db.query(Media).filter(
-                Media.tmdb_id == tmdb_id,
-                Media.media_type == doc_media_type,
-            ).first()
+            if tmdb_id not in grouped_candidates:
+                media_record = db.query(Media).filter(
+                    Media.tmdb_id == tmdb_id,
+                    Media.media_type == doc_media_type,
+                ).first()
 
-            if media_record:
-                if media_record.rating < min_rating:
-                    continue
-                if genre and genre.lower() not in (media_record.overview or "").lower():
-                    continue
+                if media_record:
+                    if media_record.rating < min_rating:
+                        continue
+                    if genre and genre.lower() not in (media_record.overview or "").lower():
+                        continue
 
-                collab_boost = 0.0
-                if int(media_record.tmdb_id) in user_likes:
-                    collab_boost = 0.2
-                elif int(media_record.tmdb_id) in user_dislikes:
-                    collab_boost = -0.3
-
+                    grouped_candidates[tmdb_id] = {
+                        "id": int(media_record.tmdb_id),
+                        "db_id": int(media_record.db_id),
+                        "title": media_record.title,
+                        "overview": media_record.overview,
+                        "release_date": media_record.release_date,
+                        "rating": float(media_record.rating),
+                        "poster_path": media_record.poster_path,
+                        "media_type": media_record.media_type,
+                        "similarity_score": -1.0,
+                        "combined_score": 0.0,
+                        "original_doc": doc,
+                    }
+            
+            if tmdb_id in grouped_candidates:
+                cand = grouped_candidates[tmdb_id]
                 semantic_similarity = 1.0 / (1.0 + similarity_score)
-                normalized_rating = (media_record.rating or 0) / 10.0
-                combined_score = (semantic_similarity * 0.7) + (normalized_rating * 0.3) + collab_boost
+                if semantic_similarity > cand["similarity_score"]:
+                    cand["similarity_score"] = semantic_similarity
 
-                candidates.append({
-                    "id": int(media_record.tmdb_id),
-                    "db_id": int(media_record.db_id),
-                    "title": media_record.title,
-                    "overview": media_record.overview,
-                    "release_date": media_record.release_date,
-                    "rating": float(media_record.rating),
-                    "poster_path": media_record.poster_path,
-                    "media_type": media_record.media_type,
-                    "similarity_score": float(semantic_similarity),
-                    "combined_score": float(combined_score),
-                    "original_doc": doc,
-                })
+        candidates = list(grouped_candidates.values())
+        for cand in candidates:
+            collab_boost = 0.0
+            if cand["id"] in user_likes:
+                collab_boost = 0.2
+            elif cand["id"] in user_dislikes:
+                collab_boost = -0.3
+            
+            normalized_rating = cand["rating"] / 10.0
+            cand["combined_score"] = (cand["similarity_score"] * 0.7) + (normalized_rating * 0.3) + collab_boost
+
+        candidates = sorted(candidates, key=lambda x: x["similarity_score"], reverse=True)[:top_k]
         return candidates
 
     def _tfidf_search(

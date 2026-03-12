@@ -84,6 +84,8 @@ class MediaEmbedding(Base):
     id = Column(Integer, primary_key=True, index=True)
     tmdb_id = Column(Integer, nullable=False, index=True)
     media_type = Column(String, nullable=False)          # "movie" | "tv"
+    chunk_index = Column(Integer, nullable=False, default=0, index=True)
+    chunk_text = Column(Text, nullable=True)
 
     if PGVECTOR_AVAILABLE and Vector is not None:
         _dim = int(os.getenv("VECTOR_DIM", "384"))
@@ -94,7 +96,7 @@ class MediaEmbedding(Base):
 
     __table_args__ = (
         # Unique constraint so upsert logic is clean
-        __import__('sqlalchemy').UniqueConstraint('tmdb_id', 'media_type', name='uq_media_embedding'),
+        __import__('sqlalchemy').UniqueConstraint('tmdb_id', 'media_type', 'chunk_index', name='uq_media_embedding_chunk'),
     )
 
 
@@ -131,25 +133,43 @@ def get_user_by_username(db: Session, username: str) -> Optional[User]:
     return db.query(User).filter(User.username == username).first()
 
 
-def get_embedding_by_tmdb_id(db: Session, tmdb_id: int, media_type: str) -> Optional[MediaEmbedding]:
+def get_embedding_by_tmdb_id(db: Session, tmdb_id: int, media_type: str, chunk_index: int = 0) -> Optional[MediaEmbedding]:
     """Return the MediaEmbedding row, or None."""
     return (
         db.query(MediaEmbedding)
-        .filter(MediaEmbedding.tmdb_id == tmdb_id, MediaEmbedding.media_type == media_type)
+        .filter(
+            MediaEmbedding.tmdb_id == tmdb_id, 
+            MediaEmbedding.media_type == media_type,
+            MediaEmbedding.chunk_index == chunk_index
+        )
         .first()
     )
 
 
-def upsert_embedding(db: Session, tmdb_id: int, media_type: str, embedding: List[float]) -> None:
+def upsert_embedding(
+    db: Session, 
+    tmdb_id: int, 
+    media_type: str, 
+    embedding: List[float], 
+    chunk_index: int = 0, 
+    chunk_text: Optional[str] = None
+) -> None:
     """
-    Insert or update the vector embedding for a given (tmdb_id, media_type) pair.
+    Insert or update the vector embedding for a given (tmdb_id, media_type, chunk_index).
     Used by data_ingestor.py when rebuilding the index.
     """
-    existing = get_embedding_by_tmdb_id(db, tmdb_id, media_type)
+    existing = get_embedding_by_tmdb_id(db, tmdb_id, media_type, chunk_index)
     if existing:
         existing.embedding = embedding
+        existing.chunk_text = chunk_text
     else:
-        db.add(MediaEmbedding(tmdb_id=tmdb_id, media_type=media_type, embedding=embedding))
+        db.add(MediaEmbedding(
+            tmdb_id=tmdb_id, 
+            media_type=media_type, 
+            embedding=embedding,
+            chunk_index=chunk_index,
+            chunk_text=chunk_text
+        ))
     db.commit()
 
 

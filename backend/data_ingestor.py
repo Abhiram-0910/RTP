@@ -3,6 +3,7 @@ import pandas as pd
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 import sys
 import io
@@ -16,6 +17,11 @@ class DataIngestor:
             model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
         )
         self.vector_store = None
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", ".", " ", ""]
+        )
 
     def create_faiss_index(self):
         print("Loading data...")
@@ -29,12 +35,14 @@ class DataIngestor:
             
             for _, row in movie_df.iterrows():
                 content = f"Title: {row['title']}. Overview: {row['overview']}"
-                documents.append(
-                    Document(
-                        page_content=content,
-                        metadata={"id": int(row["id"]), "media_type": "movie"}
+                chunks = self.text_splitter.split_text(content)
+                for i, chunk in enumerate(chunks):
+                    documents.append(
+                        Document(
+                            page_content=chunk,
+                            metadata={"id": int(row["id"]), "media_type": "movie", "chunk_index": i}
+                        )
                     )
-                )
             print(f"Added {len(movie_df)} movies for indexing.")
         else:
             print("tmdb_5000_movies.csv not found.")
@@ -46,12 +54,14 @@ class DataIngestor:
             
             for _, row in tv_df.iterrows():
                 content = f"Title: {row['title']}. Overview: {row['overview']}"
-                documents.append(
-                    Document(
-                        page_content=content,
-                        metadata={"id": int(row["id"]), "media_type": "tv"}
+                chunks = self.text_splitter.split_text(content)
+                for i, chunk in enumerate(chunks):
+                    documents.append(
+                        Document(
+                            page_content=chunk,
+                            metadata={"id": int(row["id"]), "media_type": "tv", "chunk_index": i}
+                        )
                     )
-                )
             print(f"Added {len(tv_df)} TV shows for indexing.")
         else:
             print("tmdb_tv_shows.csv not found.")
