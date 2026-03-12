@@ -269,6 +269,14 @@ class RecommendationEngine:
         prompt = (
             f"You are an expert film and TV critic specialising in explainable AI recommendations.\n"
             f"A user searched for: '{query}'.\n\n"
+            f"LANGUAGE INSTRUCTION (follow this first, before anything else):\n"
+            f"1. Detect the primary language of the user's search query above.\n"
+            f"2. Write your ENTIRE response in that same detected language.\n"
+            f"   - If the query is in Hindi, respond in Hindi.\n"
+            f"   - If the query is in Telugu, respond in Telugu.\n"
+            f"   - If the query is in English, respond in English.\n"
+            f"   - Apply this rule for any language — French, Spanish, Arabic, etc.\n"
+            f"   Do NOT translate the response back to English under any circumstances.\n\n"
             f"The recommendation engine surfaced a set of titles based on semantic similarity. "
             f"Here are the thematic summaries of those titles (names are intentionally omitted):\n"
             f"{theme_block}\n\n"
@@ -276,7 +284,8 @@ class RecommendationEngine:
             f"connects these results to the user's search intent. "
             f"Focus on mood, genre conventions, character archetypes, and storytelling style. "
             f"Do NOT mention any movie or show titles by name. "
-            f"Be specific about themes — avoid generic phrases like 'you might enjoy these'."
+            f"Be specific about themes — avoid generic phrases like 'you might enjoy these'. "
+            f"Remember: your response language must match the detected query language."
         )
         try:
             response = self.gemini_model.generate_content(prompt)
