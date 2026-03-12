@@ -229,19 +229,51 @@ class RecommendationEngine:
 
         return vec
 
-    def _calculate_diversity_score(self, movie_overview, selected_overviews):
-        """Calculate diversity score based on content similarity with already selected movies."""
+    def _calculate_diversity_score(self, movie_overview: str, selected_overviews: list) -> float:
+        """
+        Calculate a diversity score for *movie_overview* against the already-selected
+        items, using the **active multilingual embedding model** (``_safe_embed``).
+
+        Why not TF-IDF?
+        ---------------
+        ``TfidfVectorizer(stop_words='english')`` silently ignores English stop-word
+        removal for non-Latin scripts (Hindi, Telugu) and produces poor similarity
+        estimates, causing the MMR algorithm to fail at enforcing content diversity
+        for multilingual result sets.
+
+        Approach
+        --------
+        1. Embed the candidate overview with ``self._safe_embed`` — the same
+           dimension-safe wrapper used everywhere else in the engine.
+        2. Embed each already-selected overview.
+        3. Return ``1 - max_cosine_similarity``:
+           * score → 1.0  ≈ very different from all selected items  (high diversity)
+           * score → 0.0  ≈ duplicate of a selected item            (low diversity)
+
+        Fallback
+        --------
+        Returns 0.5 (neutral) when the embedding model is unavailable or any
+        runtime error occurs, so the MMR loop degrades gracefully rather than
+        crashing the recommendation request.
+        """
         if not selected_overviews:
             return 1.0
-        
-        vectorizer = TfidfVectorizer(stop_words='english', max_features=100)
+
+        if not self.embeddings:
+            return 0.5
+
         try:
-            all_texts = selected_overviews + [movie_overview]
-            tfidf_matrix = vectorizer.fit_transform(all_texts)
-            similarities = cosine_similarity(tfidf_matrix[-1:], tfidf_matrix[:-1])
-            max_sim = similarities.max()
-            return 1 - max_sim
-        except:
+            candidate_vec = self._safe_embed(movie_overview or "")
+            selected_vecs = [self._safe_embed(ov or "") for ov in selected_overviews]
+
+            import numpy as np  # noqa: PLC0415 (already top-level; guard for safety)
+            candidate_arr = np.array(candidate_vec, dtype=float).reshape(1, -1)
+            selected_arr  = np.array(selected_vecs, dtype=float)
+
+            sims = cosine_similarity(candidate_arr, selected_arr)[0]
+            return float(1.0 - sims.max())
+        except Exception as exc:
+            logger.warning("[Diversity] Embedding-based diversity calc failed: %s", exc)
             return 0.5
 
     def _generate_explanation(self, query: str, movies: list, similarities: list) -> str:

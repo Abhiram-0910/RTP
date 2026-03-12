@@ -111,10 +111,14 @@ class TMDBDataCollector:
             print(f"Exception in get_trending_tv_shows: {exc}")
         return []
 
-    def get_movie_details(self, movie_id: int) -> Optional[Dict]:
-        """Get detailed movie information."""
+    def get_movie_details(self, movie_id: int, language: str = "en-US") -> Optional[Dict]:
+        """Get detailed movie information, optionally in a TMDB-supported locale."""
         url = f"{self.base_url}/movie/{movie_id}"
-        params = {"api_key": self.api_key, "append_to_response": "credits,keywords,watch/providers"}
+        params = {
+            "api_key": self.api_key,
+            "language": language,
+            "append_to_response": "credits,keywords,watch/providers",
+        }
         try:
             resp = self._tmdb_get(url, params)
             if resp.status_code == 200:
@@ -124,10 +128,14 @@ class TMDBDataCollector:
             print(f"Exception in get_movie_details({movie_id}): {exc}")
         return None
 
-    def get_tv_show_details(self, tv_id: int) -> Optional[Dict]:
-        """Get detailed TV show information."""
+    def get_tv_show_details(self, tv_id: int, language: str = "en-US") -> Optional[Dict]:
+        """Get detailed TV show information, optionally in a TMDB-supported locale."""
         url = f"{self.base_url}/tv/{tv_id}"
-        params = {"api_key": self.api_key, "append_to_response": "credits,keywords,watch/providers"}
+        params = {
+            "api_key": self.api_key,
+            "language": language,
+            "append_to_response": "credits,keywords,watch/providers",
+        }
         try:
             resp = self._tmdb_get(url, params)
             if resp.status_code == 200:
@@ -136,6 +144,49 @@ class TMDBDataCollector:
         except Exception as exc:
             print(f"Exception in get_tv_show_details({tv_id}): {exc}")
         return None
+
+    def get_localized_overlay(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        language: str,
+    ) -> Dict[str, str]:
+        """
+        Fetch **only** the localized title and overview for a given TMDB ID and
+        locale — a single lightweight API call that avoids duplicating the full
+        credits/keywords payload.
+
+        Returns a dict ``{"title": ..., "overview": ...}`` with the localized
+        strings, or empty strings if TMDB does not have a translation.
+
+        Design note
+        -----------
+        TMDB stores canonical technical metadata (cast, crew, keywords, providers)
+        independent of locale, so we fetch those once in English and only
+        overlay ``title`` and ``overview`` per locale.  This keeps the total
+        number of API calls at::
+
+            (1 English detail + N locales) per title
+
+        instead of the naive (N locales × full detail) approach.
+        """
+        endpoint = "movie" if media_type == "movie" else "tv"
+        url = f"{self.base_url}/{endpoint}/{tmdb_id}"
+        params = {"api_key": self.api_key, "language": language}
+        try:
+            resp = self._tmdb_get(url, params)
+            if resp.status_code == 200:
+                data = resp.json()
+                # TV uses 'name', movies use 'title'
+                title    = data.get("title") or data.get("name") or ""
+                overview = data.get("overview") or ""
+                return {"title": title, "overview": overview}
+        except Exception as exc:
+            logger.warning(
+                "[Locale] Could not fetch %s overlay for id=%s lang=%s: %s",
+                media_type, tmdb_id, language, exc,
+            )
+        return {"title": "", "overview": ""}
 
     def discover_movies(self, page: int = 1, year_min: int = 2000, vote_min: float = 6.0) -> List[Dict]:
         """Discover movies based on criteria."""
@@ -212,161 +263,300 @@ class TMDBDataCollector:
         
         return list(set(platforms))  # Remove duplicates
     
-    def process_movie_data(self, movie_data: Dict) -> Dict:
-        """Process raw movie data into standardized format"""
+    def process_movie_data(
+        self,
+        movie_data: Dict,
+        locale: str = "en-US",
+        localized_data: Optional[Dict[str, str]] = None,
+    ) -> Dict:
+        """
+        Process raw movie data into a standardised row.
+
+        Parameters
+        ----------
+        movie_data      : Full TMDB movie detail response (English).
+        locale          : BCP-47 locale tag for this row (e.g. ``"hi-IN"``).
+        localized_data  : Dict with ``title`` and ``overview`` from the locale
+                          overlay call.  Falls back to the English values when
+                          the localized strings are empty.
+        """
+        loc = localized_data or {}
+        en_title    = movie_data.get("title", "")
+        en_overview = movie_data.get("overview", "")
         return {
-            "id": movie_data.get("id"),
-            "title": movie_data.get("title", ""),
-            "overview": movie_data.get("overview", ""),
-            "release_date": movie_data.get("release_date", ""),
-            "rating": movie_data.get("vote_average", 0.0),
-            "poster_path": movie_data.get("poster_path", ""),
-            "media_type": "movie",
-            "original_language": movie_data.get("original_language", "en"),
-            "runtime": movie_data.get("runtime"),
-            "budget": movie_data.get("budget"),
-            "revenue": movie_data.get("revenue"),
-            "status": movie_data.get("status", "released"),
-            "tagline": movie_data.get("tagline", ""),
-            "genres": self.extract_genres(movie_data.get("genres", [])),
-            "cast": self.extract_cast(movie_data.get("credits", {})),
-            "director": self.extract_director(movie_data.get("credits", {})),
+            "id":                  movie_data.get("id"),
+            "tmdb_id":             movie_data.get("id"),
+            "title":               loc.get("title") or en_title,
+            "title_en":            en_title,
+            "overview":            loc.get("overview") or en_overview,
+            "overview_en":         en_overview,
+            "locale":              locale,
+            "release_date":        movie_data.get("release_date", ""),
+            "rating":              movie_data.get("vote_average", 0.0),
+            "poster_path":         movie_data.get("poster_path", ""),
+            "media_type":          "movie",
+            "original_language":   movie_data.get("original_language", "en"),
+            "runtime":             movie_data.get("runtime"),
+            "budget":              movie_data.get("budget"),
+            "revenue":             movie_data.get("revenue"),
+            "status":              movie_data.get("status", "released"),
+            "tagline":             movie_data.get("tagline", ""),
+            "genres":              self.extract_genres(movie_data.get("genres", [])),
+            "cast":                self.extract_cast(movie_data.get("credits", {})),
+            "director":            self.extract_director(movie_data.get("credits", {})),
             "streaming_platforms": self.extract_streaming_platforms(movie_data.get("watch/providers", {})),
-            "popularity": movie_data.get("popularity", 0.0),
-            "imdb_id": movie_data.get("imdb_id", ""),
-            "keywords": [kw["name"] for kw in movie_data.get("keywords", {}).get("keywords", [])]
+            "popularity":          movie_data.get("popularity", 0.0),
+            "imdb_id":             movie_data.get("imdb_id", ""),
+            "keywords":            [kw["name"] for kw in movie_data.get("keywords", {}).get("keywords", [])],
         }
     
-    def process_tv_show_data(self, tv_data: Dict) -> Dict:
-        """Process raw TV show data into standardized format"""
+    def process_tv_show_data(
+        self,
+        tv_data: Dict,
+        locale: str = "en-US",
+        localized_data: Optional[Dict[str, str]] = None,
+    ) -> Dict:
+        """
+        Process raw TV show data into a standardised row.
+
+        Parameters
+        ----------
+        tv_data         : Full TMDB TV detail response (English).
+        locale          : BCP-47 locale tag for this row (e.g. ``"te-IN"``).
+        localized_data  : Dict with ``title`` and ``overview`` from the locale
+                          overlay call.  Falls back to the English values when
+                          the localized strings are empty.
+        """
+        loc = localized_data or {}
+        en_title    = tv_data.get("name", "")
+        en_overview = tv_data.get("overview", "")
         return {
-            "id": tv_data.get("id"),
-            "title": tv_data.get("name", ""),
-            "overview": tv_data.get("overview", ""),
-            "release_date": tv_data.get("first_air_date", ""),
-            "rating": tv_data.get("vote_average", 0.0),
-            "poster_path": tv_data.get("poster_path", ""),
-            "media_type": "tv",
-            "original_language": tv_data.get("original_language", "en"),
-            "runtime": tv_data.get("episode_run_time", [None])[0] if tv_data.get("episode_run_time") else None,
-            "status": tv_data.get("status", "released"),
-            "tagline": tv_data.get("tagline", ""),
-            "genres": self.extract_genres(tv_data.get("genres", [])),
-            "cast": self.extract_cast(tv_data.get("credits", {})),
-            "director": self.extract_director(tv_data.get("credits", {})),
-            "streaming_platforms": self.extract_streaming_platforms(tv_data.get("watch/providers", {})),
-            "popularity": tv_data.get("popularity", 0.0),
-            "number_of_seasons": tv_data.get("number_of_seasons"),
-            "number_of_episodes": tv_data.get("number_of_episodes"),
-            "keywords": [kw["name"] for kw in tv_data.get("keywords", {}).get("results", [])]
+            "id":                   tv_data.get("id"),
+            "tmdb_id":              tv_data.get("id"),
+            "title":                loc.get("title") or en_title,
+            "title_en":             en_title,
+            "overview":             loc.get("overview") or en_overview,
+            "overview_en":          en_overview,
+            "locale":               locale,
+            "release_date":         tv_data.get("first_air_date", ""),
+            "rating":               tv_data.get("vote_average", 0.0),
+            "poster_path":          tv_data.get("poster_path", ""),
+            "media_type":           "tv",
+            "original_language":    tv_data.get("original_language", "en"),
+            "runtime":              tv_data.get("episode_run_time", [None])[0] if tv_data.get("episode_run_time") else None,
+            "status":               tv_data.get("status", "released"),
+            "tagline":              tv_data.get("tagline", ""),
+            "genres":               self.extract_genres(tv_data.get("genres", [])),
+            "cast":                 self.extract_cast(tv_data.get("credits", {})),
+            "director":             self.extract_director(tv_data.get("credits", {})),
+            "streaming_platforms":  self.extract_streaming_platforms(tv_data.get("watch/providers", {})),
+            "popularity":           tv_data.get("popularity", 0.0),
+            "number_of_seasons":    tv_data.get("number_of_seasons"),
+            "number_of_episodes":   tv_data.get("number_of_episodes"),
+            "keywords":             [kw["name"] for kw in tv_data.get("keywords", {}).get("results", [])],
         }
     
-    def collect_comprehensive_dataset(self, target_size: int = 10000, batch_size: int = 20) -> pd.DataFrame:
-        """Collect comprehensive dataset with movies and TV shows."""
+    def collect_comprehensive_dataset(
+        self,
+        target_size: int = 10000,
+        batch_size: int = 20,
+        locales: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """
+        Collect a multilingual dataset of movies and TV shows.
+
+        For each unique TMDB title found:
+        1. Fetch full English details once (credits, keywords, providers).
+        2. For every locale in *locales*, call ``get_localized_overlay`` to get
+           the translated title and overview in a single lightweight API call.
+        3. Produce one row per ``(tmdb_id, locale)`` in the output DataFrame.
+
+        The output DataFrame contains:
+        - ``title`` / ``overview``     — in the row's locale (falls back to English
+          when TMDB has no translation).
+        - ``title_en`` / ``overview_en``  — always the English original.
+        - ``locale``                   — BCP-47 locale tag ("en-US", "hi-IN", "te-IN").
+
+        Parameters
+        ----------
+        target_size : Maximum rows **per locale** to keep (sorted by popularity).
+        locales     : List of BCP-47 locale strings to collect.
+                      Default: ``["en-US", "hi-IN", "te-IN"]``.
+        """
+        if locales is None:
+            locales = ["en-US", "hi-IN", "te-IN"]
+
         all_media: list = []
 
-        print(f"Starting comprehensive data collection targeting {target_size} titles...")
+        print(f"Starting multilingual data collection for locales: {locales}")
+        print(f"Targeting {target_size} rows per locale → ~{target_size * len(locales)} total rows.")
 
-        # ── Trending content (high quality, recent) ───────────────────────────
-        print("Collecting trending movies and TV shows...")
-        trending_movies: list = []
-        trending_tv: list = []
+        # ── Step 1: Discover unique TMDB IDs (locale-independent) ────────────
+        print("\n[1/3] Collecting trending content IDs...")
+        trending_movie_ids: set = set()
+        trending_tv_ids:    set = set()
 
-        for page in range(1, 6):  # 5 pages of trending content
-            # No sleep needed — _tmdb_get retries with Retry-After when rate-limited
-            trending_movies.extend(self.get_trending_movies("week", page))
-            trending_tv.extend(self.get_trending_tv_shows("week", page))
+        for page in range(1, 6):
+            for m in self.get_trending_movies("week", page):
+                trending_movie_ids.add(m["id"])
+            for t in self.get_trending_tv_shows("week", page):
+                trending_tv_ids.add(t["id"])
 
-        print(f"Found {len(trending_movies)} trending movies and {len(trending_tv)} trending TV shows")
+        print(f"    {len(trending_movie_ids)} trending movies, {len(trending_tv_ids)} trending TV shows.")
 
-        # ── Discovery content (diverse, high-rated) ───────────────────────────
-        print("Discovering high-rated movies and TV shows...")
-        discovered_movies: list = []
-        discovered_tv: list = []
+        print("[1/3] Discovering high-rated content...")
+        discovered_movie_ids: set = set()
+        discovered_tv_ids:    set = set()
 
-        for page in range(1, 21):  # 20 pages of discovered content
-            discovered_movies.extend(self.discover_movies(page, year_min=2010, vote_min=7.0))
-            discovered_tv.extend(self.discover_tv_shows(page, year_min=2010, vote_min=7.0))
+        for page in range(1, 21):
+            for m in self.discover_movies(page, year_min=2010, vote_min=7.0):
+                discovered_movie_ids.add(m["id"])
+            for t in self.discover_tv_shows(page, year_min=2010, vote_min=7.0):
+                discovered_tv_ids.add(t["id"])
             if page % 5 == 0:
-                print(f"Completed {page} pages of discovery...")
-            # No sleep here — tenacity handles rate limits inside each call
+                print(f"    Completed {page}/20 discovery pages...")
 
-        print(f"Found {len(discovered_movies)} discovered movies and {len(discovered_tv)} discovered TV shows")
+        all_movie_ids = list(trending_movie_ids | discovered_movie_ids)
+        all_tv_ids    = list(trending_tv_ids    | discovered_tv_ids)
+        print(f"    {len(all_movie_ids)} unique movies, {len(all_tv_ids)} unique TV shows.")
 
-        # Combine and deduplicate by TMDB ID
-        all_movie_ids = list(set(m["id"] for m in trending_movies + discovered_movies))
-        all_tv_ids    = list(set(t["id"] for t in trending_tv    + discovered_tv))
+        # ── Step 2: Fetch full English details once per ID ────────────────────
+        print("\n[2/3] Fetching full English details (credits, keywords, providers)...")
 
-        print(f"Processing {len(all_movie_ids)} unique movies and {len(all_tv_ids)} unique TV shows")
+        # English base detail cache: tmdb_id -> raw TMDB response
+        movie_details_cache: dict = {}
+        tv_details_cache:    dict = {}
 
-        # ── Process movies in parallel ────────────────────────────────────────
-        print("Processing movie details...")
         with ThreadPoolExecutor(max_workers=5) as executor:
-            movie_futures = [
-                executor.submit(self.get_movie_details, mid)
+            futures = {
+                executor.submit(self.get_movie_details, mid, "en-US"): mid
                 for mid in all_movie_ids[:5000]
-            ]
-            for future in as_completed(movie_futures):
-                movie_data = future.result()
+            }
+            for future in as_completed(futures):
+                data = future.result()
                 if (
-                    movie_data
-                    and movie_data.get("overview")
-                    and movie_data.get("vote_average", 0) > 5.0
+                    data
+                    and data.get("overview")
+                    and data.get("vote_average", 0) > 5.0
                 ):
-                    all_media.append(self.process_movie_data(movie_data))
-                # No time.sleep — rate-limit retries happen inside get_movie_details
+                    movie_details_cache[data["id"]] = data
 
-        # ── Process TV shows in parallel ──────────────────────────────────────
-        print("Processing TV show details...")
         with ThreadPoolExecutor(max_workers=5) as executor:
-            tv_futures = [
-                executor.submit(self.get_tv_show_details, tid)
+            futures = {
+                executor.submit(self.get_tv_show_details, tid, "en-US"): tid
                 for tid in all_tv_ids[:5000]
-            ]
-            for future in as_completed(tv_futures):
-                tv_data = future.result()
+            }
+            for future in as_completed(futures):
+                data = future.result()
                 if (
-                    tv_data
-                    and tv_data.get("overview")
-                    and tv_data.get("vote_average", 0) > 5.0
+                    data
+                    and data.get("overview")
+                    and data.get("vote_average", 0) > 5.0
                 ):
-                    all_media.append(self.process_tv_show_data(tv_data))
-                # No time.sleep — rate-limit retries happen inside get_tv_show_details
+                    tv_details_cache[data["id"]] = data
 
-        print(f"Successfully processed {len(all_media)} titles")
+        print(
+            f"    Cached {len(movie_details_cache)} movies and "
+            f"{len(tv_details_cache)} TV shows in English."
+        )
 
-        # Convert to DataFrame
-        df = pd.DataFrame(all_media)
+        # ── Step 3: For each locale, overlay title+overview and build rows ─────
+        print("\n[3/3] Generating localized rows...")
 
-        # Add additional metadata
-        df["popularity_score"] = df["popularity"].fillna(0)
-        df["trending_score"]   = 0.0
-        df["last_updated"]     = datetime.utcnow()
+        locale_frames: list = []
 
-        # Sort by popularity and rating
-        df = df.sort_values(["popularity_score", "rating"], ascending=[False, False])
+        for locale in locales:
+            print(f"\n  Locale: {locale}")
+            locale_rows: list = []
 
-        # Limit to target size
-        if len(df) > target_size:
-            df = df.head(target_size)
+            # Movies
+            def _fetch_movie_locale(mid_data, _locale=locale):
+                mid, en_data = mid_data
+                if _locale == "en-US":
+                    overlay = {
+                        "title":    en_data.get("title", ""),
+                        "overview": en_data.get("overview", ""),
+                    }
+                else:
+                    overlay = self.get_localized_overlay(mid, "movie", _locale)
+                return self.process_movie_data(en_data, locale=_locale, localized_data=overlay)
 
-        print(f"Final dataset contains {len(df)} titles")
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                m_futures = [
+                    executor.submit(_fetch_movie_locale, item)
+                    for item in movie_details_cache.items()
+                ]
+                for future in as_completed(m_futures):
+                    result = future.result()
+                    if result:
+                        locale_rows.append(result)
+
+            # TV shows
+            def _fetch_tv_locale(tid_data, _locale=locale):
+                tid, en_data = tid_data
+                if _locale == "en-US":
+                    overlay = {
+                        "title":    en_data.get("name", ""),
+                        "overview": en_data.get("overview", ""),
+                    }
+                else:
+                    overlay = self.get_localized_overlay(tid, "tv", _locale)
+                return self.process_tv_show_data(en_data, locale=_locale, localized_data=overlay)
+
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                t_futures = [
+                    executor.submit(_fetch_tv_locale, item)
+                    for item in tv_details_cache.items()
+                ]
+                for future in as_completed(t_futures):
+                    result = future.result()
+                    if result:
+                        locale_rows.append(result)
+
+            # Sort and cap per locale
+            locale_df = pd.DataFrame(locale_rows)
+            if not locale_df.empty:
+                locale_df["popularity_score"] = locale_df["popularity"].fillna(0)
+                locale_df = locale_df.sort_values(
+                    ["popularity_score", "rating"], ascending=[False, False]
+                )
+                if len(locale_df) > target_size:
+                    locale_df = locale_df.head(target_size)
+
+            print(f"    {len(locale_df)} rows for locale '{locale}'.")
+            locale_frames.append(locale_df)
+
+        # ── Combine all locales ────────────────────────────────────────────────
+        df = pd.concat(locale_frames, ignore_index=True) if locale_frames else pd.DataFrame()
+        df["trending_score"] = 0.0
+        df["last_updated"]   = datetime.utcnow()
+
+        print(f"\nFinal multilingual dataset: {len(df)} rows across {len(locales)} locales.")
         return df
 
+
     def save_dataset(self, df: pd.DataFrame, output_path: str = "../data/enhanced_dataset.csv"):
-        """Save the collected dataset to CSV"""
+        """Save the collected multilingual dataset to CSV files."""
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         df.to_csv(output_path, index=False)
         print(f"Dataset saved to {output_path}")
-        
-        # Also save separate files for movies and TV shows
+
+        # Per-media-type splits
         movies_df = df[df["media_type"] == "movie"]
-        tv_df = df[df["media_type"] == "tv"]
-        
+        tv_df     = df[df["media_type"] == "tv"]
         movies_df.to_csv("../data/enhanced_movies.csv", index=False)
         tv_df.to_csv("../data/enhanced_tv_shows.csv", index=False)
-        
-        print(f"Saved {len(movies_df)} movies and {len(tv_df)} TV shows separately")
+        print(f"Saved {len(movies_df)} movie rows and {len(tv_df)} TV show rows.")
+
+        # Per-locale splits (useful for locale-specific ingestion)
+        if "locale" in df.columns:
+            for locale in df["locale"].unique():
+                locale_path = os.path.join(
+                    os.path.dirname(output_path),
+                    f"enhanced_dataset_{locale.replace('-', '_')}.csv",
+                )
+                df[df["locale"] == locale].to_csv(locale_path, index=False)
+            print(f"Saved per-locale CSV files for: {list(df['locale'].unique())}")
 
 def main():
     """Main function to collect comprehensive dataset"""
