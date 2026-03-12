@@ -28,22 +28,16 @@ except ImportError:
         "Install with: pip install implicit"
     )
 
-# ── Sentiment backend selection ──────────────────────────────────────────────────────
-# We try VADER first (fast, dependency-free install: `pip install vaderSentiment`).
-# If it is not available we fall back to a HuggingFace zero-shot pipeline which
-# downloads on first use but requires no extra GPU.
-_VADER_ANALYZER = None
-_HF_SENTIMENT_PIPE = None
-
-try:
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer as _VaderAnalyzer
-    _VADER_ANALYZER = _VaderAnalyzer()
-    logger.info("[Sentiment] Using VADER for review polarity analysis.")
-except ImportError:
-    logger.warning(
-        "[Sentiment] vaderSentiment not installed — will attempt HuggingFace pipeline. "
-        "Install with: pip install vaderSentiment"
-    )
+# ── Multilingual Sentiment backend ──────────────────────────────────────────────────────
+# We use ``cardiffnlp/twitter-xlm-roberta-base-sentiment`` — a XLM-RoBERTa
+# checkpoint fine-tuned on multilingual tweets for 3-class sentiment
+# (Negative / Neutral / Positive).  It handles English, Hindi, Telugu, and
+# 100+ other languages natively in a single model without any translation step.
+#
+# The pipeline is lazy-loaded on the first real call so that importing this
+# module does not block the FastAPI startup sequence with a ~300 MB download.
+_XLM_SENTIMENT_PIPE = None
+_XLM_MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
 
 
 class AdvancedRecommendationEngine:
@@ -200,64 +194,82 @@ class AdvancedRecommendationEngine:
         """
         Parse *reviews_text* and return a **normalised polarity score** in [-1.0, 1.0].
 
-        Positive scores  (+0.1 → +1.0) indicate overwhelmingly favourable reviews.
-        Negative scores  (-0.1 → -1.0) indicate predominantly critical/negative reviews.
-        Values near zero indicate mixed or neutral sentiment.
+        This method uses ``cardiffnlp/twitter-xlm-roberta-base-sentiment``, a
+        multilingual XLM-RoBERTa model fine-tuned on tweets across 100+ languages.
+        It handles **English, Hindi, Telugu**, and all other languages present in
+        TMDB review data natively — no translation step required.
 
-        Backend priority
-        ----------------
-        1. **VADER** (``vaderSentiment``) — fast, rule-based, great for short review
-           snippets. Returns the ``compound`` score which is already in [-1, 1].
-        2. **HuggingFace pipeline** (``distilbert-base-uncased-finetuned-sst-2-english``
-           loaded lazily) — slightly slower but more accurate on full sentences.
-        3. Neutral fallback (0.0) when no backend is available.
+        Label mapping
+        -------------
+        The model outputs 3-class softmax probabilities::
+
+            polarity = P(Positive) - P(Negative)   ∈ [-1, 1]
+
+        ``Neutral`` contributes indirectly by reducing both ``Positive`` and
+        ``Negative`` probabilities, naturally compressing the polarity toward 0.
+
+        Pipeline
+        --------
+        The pipeline is lazy-loaded once on the first call and reused.  Returns
+        0.0 (neutral) silently if ``transformers`` is not installed or the
+        HuggingFace hub is unreachable.
         """
-        global _VADER_ANALYZER, _HF_SENTIMENT_PIPE
+        global _XLM_SENTIMENT_PIPE
 
         if not reviews_text or not reviews_text.strip():
             return 0.0  # No review data — neutral
 
-        # Truncate to keep inference fast; most review snippets fit in 512 tokens
         text = reviews_text.strip()[:1024]
 
-        # ── Path 1: VADER ───────────────────────────────────────────────────────────
-        if _VADER_ANALYZER is not None:
-            try:
-                scores = _VADER_ANALYZER.polarity_scores(text)
-                return float(scores["compound"])  # already in [-1, 1]
-            except Exception as exc:
-                logger.warning("VADER scoring failed: %s", exc)
-
-        # ── Path 2: HuggingFace pipeline (lazy-loaded) ───────────────────────────
-        if _HF_SENTIMENT_PIPE is None:
+        # ── Lazy-load XLM-RoBERTa multilingual pipeline ────────────────────────
+        if _XLM_SENTIMENT_PIPE is None:
             try:
                 from transformers import pipeline as hf_pipeline  # noqa: PLC0415
-                _HF_SENTIMENT_PIPE = hf_pipeline(
-                    "sentiment-analysis",
-                    model="distilbert-base-uncased-finetuned-sst-2-english",
+                _XLM_SENTIMENT_PIPE = hf_pipeline(
+                    task="sentiment-analysis",
+                    model=_XLM_MODEL_NAME,
+                    tokenizer=_XLM_MODEL_NAME,
                     truncation=True,
                     max_length=512,
+                    # top_k=None returns all label scores for the weighted formula
+                    top_k=None,
                 )
-                logger.info("[Sentiment] Loaded HuggingFace distilbert-sst2 pipeline.")
-            except Exception as exc:
-                logger.warning("[Sentiment] Could not load HuggingFace pipeline: %s", exc)
+                logger.info(
+                    "[Sentiment] Loaded multilingual XLM-RoBERTa pipeline (%s).",
+                    _XLM_MODEL_NAME,
+                )
+            except Exception as load_exc:
+                logger.warning(
+                    "[Sentiment] Could not load XLM-RoBERTa pipeline: %s. "
+                    "Returning neutral score 0.0.",
+                    load_exc,
+                )
+                return 0.0
 
-        if _HF_SENTIMENT_PIPE is not None:
-            try:
-                result = _HF_SENTIMENT_PIPE(text[:512])[0]  # pipeline max_length guard
-                # result = {"label": "POSITIVE"|"NEGATIVE", "score": 0.0–1.0}
-                raw_score = float(result["score"])  # confidence in [0.5, 1.0]
-                # Map to signed polarity:
-                #   POSITIVE confidence 0.9 → +0.8,  NEGATIVE confidence 0.9 → -0.8
-                polarity = (raw_score - 0.5) * 2  # [0, 1] range
-                if result["label"] == "NEGATIVE":
-                    polarity = -polarity
-                return float(np.clip(polarity, -1.0, 1.0))
-            except Exception as exc:
-                logger.warning("HuggingFace sentiment inference failed: %s", exc)
+        # ── Inference ───────────────────────────────────────────────────────────
+        try:
+            # Returns a list of {label, score} dicts for all 3 classes, e.g.:
+            # [{"label": "Positive", "score": 0.82},
+            #  {"label": "Neutral",  "score": 0.13},
+            #  {"label": "Negative", "score": 0.05}]
+            label_scores = _XLM_SENTIMENT_PIPE(text)[0]
 
-        # ── Path 3: Neutral fallback ────────────────────────────────────────────────
-        return 0.0
+            scores_map: dict = {
+                entry["label"].lower(): float(entry["score"])
+                for entry in label_scores
+            }
+
+            pos = scores_map.get("positive", 0.0)
+            neg = scores_map.get("negative", 0.0)
+            # Neutral is intentionally excluded — it carries no directional signal.
+            # polarity ∈ [-1, 1] because pos + neg ≤ 1.0 (softmax with Neutral)
+            polarity = pos - neg
+            return float(np.clip(polarity, -1.0, 1.0))
+
+        except Exception as inf_exc:
+            logger.warning("[Sentiment] XLM-RoBERTa inference failed: %s", inf_exc)
+            return 0.0
+
 
     def _calculate_content_scores(
         self, query_embedding: np.ndarray, items: List[Dict]

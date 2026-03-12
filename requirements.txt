@@ -30,5 +30,9 @@ celery>=5.3.0
 
 # Recommendation Engine enhancements
 implicit>=0.7.2          # ALS matrix factorization (collaborative filtering)
-vaderSentiment>=3.3.2    # Fast rule-based sentiment analysis for review scoring
-scipy>=1.12.0            # Sparse matrix support required by implicit
+scipy>=1.12.0            # Sparse matrix support required by implicit
+
+# Multilingual sentiment analysis (replaces vaderSentiment)
+# cardiffnlp/twitter-xlm-roberta-base-sentiment supports English, Hindi, Telugu, and 100+ languages
+transformers>=4.38.0     # HuggingFace pipeline + XLM-RoBERTa tokenizer/model
+torch>=2.0.0             # PyTorch backend for transformers inference (CPU-only is fine)
