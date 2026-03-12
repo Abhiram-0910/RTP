@@ -23,8 +23,9 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import redis
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
@@ -71,6 +72,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── CORS-safe exception handler ───────────────────────────────────────────────
+# FastAPI's CORSMiddleware does NOT add CORS headers to error responses (4xx/5xx).
+# Without this handler, a 401 from the backend shows up in the browser as a
+# phantom "CORS policy" error, hiding the real problem.
+@app.exception_handler(Exception)
+async def _cors_safe_exception_handler(request: Request, exc: Exception):
+    origin = request.headers.get("origin", "")
+    status_code = exc.status_code if isinstance(exc, HTTPException) else 500
+    detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+    headers = {}
+    if origin in ALLOWED_ORIGINS:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+        headers["Vary"] = "Origin"
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail},
+        headers=headers,
+    )
 
 # Register auth router (exposes /token)
 app.include_router(auth_router)

@@ -72,6 +72,12 @@ api.interceptors.response.use(
   }
 );
 
+// ── Unauthenticated instance for public endpoints ────────────────────────────
+// Using the authenticated `api` instance for /api/recommend was causing 401s
+// when the stored token was expired, which the browser misreported as a CORS
+// error because FastAPI does not attach CORS headers to error responses.
+const publicApi = axios.create({ baseURL: BASE });
+
 // ── Auth ───────────────────────────────────────────────────────────────────────
 export const login = (username, password) => {
   const form = new URLSearchParams();
@@ -83,11 +89,11 @@ export const login = (username, password) => {
 export const register = (username, password) =>
   api.post('/api/register', { username, password });
 
-// ── Recommendations ────────────────────────────────────────────────────────────
+// ── Recommendations (public — no auth required) ───────────────────────────────
 export const getRecommendations = (payload) =>
-  api.post('/api/recommend', payload);
+  publicApi.post('/api/recommend', payload);
 
-// ── Interactions ───────────────────────────────────────────────────────────────
+// ── Interactions (JWT-protected) ───────────────────────────────────────────────
 export const rateTitle = (tmdbId, interactionType) =>
   api.post('/api/rate', { tmdb_id: tmdbId, interaction_type: interactionType });
 
