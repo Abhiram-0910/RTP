@@ -85,7 +85,7 @@ def _do_refresh_trending():
         return
 
     try:
-        from enhanced_database import get_db_session, Media, TrendingMedia
+        from backend.enhanced_database import get_db_session, Media, TrendingMedia
     except ImportError:
         print("[tasks] Could not import enhanced_database.")
         return
@@ -156,7 +156,7 @@ def _do_update_providers(tmdb_ids: list):
         return
 
     try:
-        from enhanced_database import get_db_session, Media, StreamingPlatform, media_platforms
+        from backend.enhanced_database import get_db_session, Media, StreamingPlatform, media_platforms
     except ImportError:
         return
 

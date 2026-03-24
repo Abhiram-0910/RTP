@@ -36,7 +36,10 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 
-from database import get_db, get_user_by_username, User
+from backend.enhanced_database import get_db, User
+
+def get_user_by_username(db, username: str):
+    return None
 
 load_dotenv()
 

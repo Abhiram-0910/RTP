@@ -1,1 +1,1 @@
-# Package initialization
+# MIRAI backend package

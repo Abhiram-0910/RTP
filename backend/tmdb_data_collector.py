@@ -1,586 +1,836 @@
-import requests
-import pandas as pd
-import time
-import os
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+"""
+MIRAI — Async TMDB data collection script
+=========================================
 
+Collects movies and TV shows from TMDB, fetches streaming platform data,
+generates sentence-transformer embeddings, and upserts everything into the
+PostgreSQL ``media`` table.
+
+Run standalone:
+    python -m backend.tmdb_data_collector
+
+Or directly:
+    python backend/tmdb_data_collector.py
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sys
+from dataclasses import dataclass, field
+from typing import Any
+
+import aiohttp
+from dotenv import load_dotenv
+from sentence_transformers import SentenceTransformer
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
-    wait_fixed,
-    before_sleep_log,
-    RetryError,
 )
-import logging
 
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+load_dotenv()
+
+TMDB_API_KEY: str = os.environ["TMDB_API_KEY"]
+DATABASE_URL: str = os.environ["DATABASE_URL"]
+TMDB_BASE_URL: str = "https://api.themoviedb.org/3"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+    stream=sys.stdout,
+)
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+MOVIE_PAGES: int = 500       # ~20 results/page → ~10 000 movies
+TV_PAGES: int = 250          # ~20 results/page → ~5 000 shows
+BATCH_SIZE: int = 50         # DB upsert batch
+PROGRESS_EVERY: int = 500    # Print progress every N records
+COUNTRY_CODE: str = "IN"     # Streaming providers country
+EMBED_MODEL_NAME: str = "paraphrase-multilingual-MiniLM-L12-v2"
+MAX_CAST: int = 3            # Top cast members to embed
 
-class _RateLimitError(Exception):
+# Additional TMDB endpoint sweeps to hit 10 000+ unique titles
+MOVIE_TOP_RATED_PAGES: int = 200
+MOVIE_NOW_PLAYING_PAGES: int = 50
+MOVIE_UPCOMING_PAGES: int = 50
+TV_TOP_RATED_PAGES: int = 200
+# /discover/movie genre sweeps: genre_id → pages
+DISCOVER_GENRE_PAGES: dict[int, int] = {
+    28:    30,   # Action
+    18:    30,   # Drama
+    35:    30,   # Comedy
+    53:    30,   # Thriller
+    10749: 30,   # Romance
+    878:   30,   # Sci-Fi
+    27:    30,   # Horror
+    16:    30,   # Animation
+    9648:  30,   # Mystery
+    80:    30,   # Crime
+}
+
+
+# ---------------------------------------------------------------------------
+# Tenacity retry helpers
+# ---------------------------------------------------------------------------
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry on HTTP 429 (rate-limit) or 500 (server error)."""
+    return (
+        isinstance(exc, aiohttp.ClientResponseError)
+        and exc.status in {429, 500}
+    )
+
+
+def _retrying():
+    """Return a tenacity ``retry`` decorator configured per spec."""
+    return retry(
+        retry=retry_if_exception(_is_retryable),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        stop=stop_after_attempt(5),
+        reraise=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Raw data container
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RawMedia:
+    tmdb_id: int
+    title: str
+    media_type: str          # "movie" or "tv"
+    overview: str
+    genres: list[str]
+    cast_names: list[str]
+    release_date: str
+    vote_average: float
+    popularity: float
+    poster_path: str
+    platforms: dict[str, list[str]]
+    original_language: str = ""     # ISO 639-1 code from TMDB (e.g. 'hi', 'te', 'ta')
+    original_title: str = ""        # Native-script title (e.g. Devanagari, Telugu script)
+    text_for_embedding: str = field(default="", init=False)
+
+    def build_embedding_text(self) -> None:
+        genres_str = ", ".join(self.genres) if self.genres else "Unknown"
+        cast_str = ", ".join(self.cast_names[:MAX_CAST]) if self.cast_names else "Unknown"
+        # Prefer native-script title so the multilingual model sees actual script.
+        # Falls back to romanized/English title if original_title is absent.
+        display_title = self.original_title.strip() if self.original_title.strip() else self.title
+        self.text_for_embedding = (
+            f"{display_title}. "
+            f"{self.overview}. "
+            f"Genres: {genres_str}. "
+            f"Cast: {cast_str}."
+        ).strip()
+
+
+# ---------------------------------------------------------------------------
+# TMDB HTTP helpers
+# ---------------------------------------------------------------------------
+
+@_retrying()
+async def _get_json(
+    session: aiohttp.ClientSession,
+    path: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """
-    Raised internally by ``_tmdb_get`` when TMDB returns HTTP 429.
-    tenacity catches this class and applies the configured wait strategy.
+    Perform a single authenticated GET request against the TMDB API.
+    Raises ``aiohttp.ClientResponseError`` on non-2xx responses so that
+    tenacity can catch it via ``_is_retryable``.
     """
-    def __init__(self, retry_after: float = 0.0):
-        self.retry_after = retry_after
-        super().__init__(f"TMDB rate-limited (Retry-After: {retry_after}s)")
+    base_params = {"api_key": TMDB_API_KEY, "language": "en-US"}
+    if params:
+        base_params.update(params)
 
-class TMDBDataCollector:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://api.themoviedb.org/3"
-        self.image_base_url = "https://image.tmdb.org/t/p/w500"
+    async with session.get(
+        f"{TMDB_BASE_URL}{path}",
+        params=base_params,
+        raise_for_status=True,
+    ) as resp:
+        return await resp.json()
 
-    # ── Core HTTP helper ─────────────────────────────────────────────────────
 
-    @staticmethod
-    def _retry_wait(retry_state) -> float:
-        """
-        Custom tenacity wait function.
+async def fetch_page(
+    session: aiohttp.ClientSession,
+    media_type: str,
+    page: int,
+) -> list[dict[str, Any]]:
+    """Fetch one page of popular movies or TV shows."""
+    data = await _get_json(session, f"/{media_type}/popular", {"page": page})
+    return data.get("results", [])
 
-        If the last exception was a ``_RateLimitError`` and TMDB supplied a
-        ``Retry-After`` header, sleep for exactly that many seconds.
-        Otherwise fall back to full-jitter exponential backoff (1-60 s).
-        """
-        exc = retry_state.outcome.exception()
-        if isinstance(exc, _RateLimitError) and exc.retry_after > 0:
-            print(f"[TMDB] Rate limited. Honouring Retry-After: {exc.retry_after}s")
-            return exc.retry_after
-        # Exponential backoff: 2^attempt seconds, capped at 60, with jitter
-        exp = wait_exponential(multiplier=1, min=2, max=60)
-        return exp(retry_state)
 
-    def _tmdb_get(self, url: str, params: dict) -> requests.Response:
-        """
-        Central GET helper with tenacity-powered retry logic.
+async def fetch_credits(
+    session: aiohttp.ClientSession,
+    media_type: str,
+    tmdb_id: int,
+) -> list[str]:
+    """Return the top ``MAX_CAST`` cast names for a title."""
+    try:
+        data = await _get_json(session, f"/{media_type}/{tmdb_id}/credits")
+        cast = data.get("cast", [])
+        return [m["name"] for m in cast[:MAX_CAST] if "name" in m]
+    except Exception as exc:
+        logger.debug("Credits fetch failed for %s %s: %s", media_type, tmdb_id, exc)
+        return []
 
-        Retry policy
-        ------------
-        * Catches only ``_RateLimitError`` (HTTP 429) and transient network
-          errors (``requests.exceptions.RequestException``).
-        * Up to 6 attempts total.
-        * Wait time: ``Retry-After`` header value when present, else
-          exponential backoff (2-60 s).
-        * Raises ``RetryError`` after exhausting all attempts.
-        """
-        @retry(
-            retry=retry_if_exception_type((_RateLimitError, requests.exceptions.RequestException)),
-            stop=stop_after_attempt(6),
-            wait=self._retry_wait,
-            reraise=False,
-            before_sleep=before_sleep_log(logger, logging.WARNING),
+
+async def fetch_watch_providers(
+    session: aiohttp.ClientSession,
+    media_type: str,
+    tmdb_id: int,
+) -> dict[str, list[str]]:
+    """
+    Return a dict mapping country codes to flat-rate platform name lists.
+    Only flatrate (subscription) providers are included.
+
+    Example: {"IN": ["Netflix", "Amazon Prime Video"]}
+    """
+    try:
+        data = await _get_json(session, f"/{media_type}/{tmdb_id}/watch/providers")
+        results: dict[str, Any] = data.get("results", {})
+        platforms: dict[str, list[str]] = {}
+        for country, info in results.items():
+            flatrate = info.get("flatrate", [])
+            names = [p["provider_name"] for p in flatrate if "provider_name" in p]
+            if names:
+                platforms[country] = names
+        return platforms
+    except Exception as exc:
+        logger.debug(
+            "Watch providers fetch failed for %s %s: %s", media_type, tmdb_id, exc
         )
-        def _get() -> requests.Response:
-            resp = requests.get(url, params=params, timeout=10)
-            if resp.status_code == 429:
-                # Parse Retry-After if available (TMDB sends it as an integer)
-                retry_after = float(resp.headers.get("Retry-After", 0))
-                raise _RateLimitError(retry_after=retry_after)
-            return resp
+        return {}
 
-        return _get()
 
-    def get_trending_movies(self, time_window: str = "week", page: int = 1) -> List[Dict]:
-        """Get trending movies from TMDB."""
-        url = f"{self.base_url}/trending/movie/{time_window}"
-        params = {"api_key": self.api_key, "page": page}
+# ---------------------------------------------------------------------------
+# Genre ID → name mapping (fetched once at startup)
+# ---------------------------------------------------------------------------
+
+async def build_genre_map(session: aiohttp.ClientSession) -> dict[int, str]:
+    """Build a combined genre-id → genre-name map for movies and TV shows."""
+    genre_map: dict[int, str] = {}
+    for media_type in ("movie", "tv"):
         try:
-            resp = self._tmdb_get(url, params)
-            if resp.status_code == 200:
-                return resp.json().get("results", [])
-            print(f"Error fetching trending movies: {resp.status_code}")
+            data = await _get_json(session, f"/genre/{media_type}/list")
+            for g in data.get("genres", []):
+                genre_map[g["id"]] = g["name"]
         except Exception as exc:
-            print(f"Exception in get_trending_movies: {exc}")
-        return []
+            logger.warning("Could not load %s genres: %s", media_type, exc)
+    return genre_map
 
-    def get_trending_tv_shows(self, time_window: str = "week", page: int = 1) -> List[Dict]:
-        """Get trending TV shows from TMDB."""
-        url = f"{self.base_url}/trending/tv/{time_window}"
-        params = {"api_key": self.api_key, "page": page}
-        try:
-            resp = self._tmdb_get(url, params)
-            if resp.status_code == 200:
-                return resp.json().get("results", [])
-            print(f"Error fetching trending TV shows: {resp.status_code}")
-        except Exception as exc:
-            print(f"Exception in get_trending_tv_shows: {exc}")
-        return []
 
-    def get_movie_details(self, movie_id: int, language: str = "en-US") -> Optional[Dict]:
-        """Get detailed movie information, optionally in a TMDB-supported locale."""
-        url = f"{self.base_url}/movie/{movie_id}"
-        params = {
-            "api_key": self.api_key,
-            "language": language,
-            "append_to_response": "credits,keywords,watch/providers",
-        }
-        try:
-            resp = self._tmdb_get(url, params)
-            if resp.status_code == 200:
-                return resp.json()
-            print(f"Error fetching movie details for {movie_id}: {resp.status_code}")
-        except Exception as exc:
-            print(f"Exception in get_movie_details({movie_id}): {exc}")
-        return None
+# ---------------------------------------------------------------------------
+# Page collection — movies and TV shows
+# ---------------------------------------------------------------------------
 
-    def get_tv_show_details(self, tv_id: int, language: str = "en-US") -> Optional[Dict]:
-        """Get detailed TV show information, optionally in a TMDB-supported locale."""
-        url = f"{self.base_url}/tv/{tv_id}"
-        params = {
-            "api_key": self.api_key,
-            "language": language,
-            "append_to_response": "credits,keywords,watch/providers",
-        }
-        try:
-            resp = self._tmdb_get(url, params)
-            if resp.status_code == 200:
-                return resp.json()
-            print(f"Error fetching TV show details for {tv_id}: {resp.status_code}")
-        except Exception as exc:
-            print(f"Exception in get_tv_show_details({tv_id}): {exc}")
-        return None
+async def _ingest_results(
+    session: aiohttp.ClientSession,
+    results: list[dict[str, Any]],
+    media_type: str,
+    genre_map: dict[int, str],
+    all_items: list["RawMedia"],
+    seen_ids: set[tuple[str, int]],
+) -> None:
+    """
+    Process a single page of TMDB results, deduplicate by (media_type, tmdb_id),
+    fetch credits + watch providers for each new title, and append to all_items.
+    """
+    for item in results:
+        tmdb_id: int = item.get("id", 0)
+        if not tmdb_id:
+            continue
+        key = (media_type, tmdb_id)
+        if key in seen_ids:
+            continue
+        seen_ids.add(key)
 
-    def get_localized_overlay(
-        self,
-        tmdb_id: int,
-        media_type: str,
-        language: str,
-    ) -> Dict[str, str]:
-        """
-        Fetch **only** the localized title and overview for a given TMDB ID and
-        locale — a single lightweight API call that avoids duplicating the full
-        credits/keywords payload.
+        title = item.get("title") or item.get("name") or ""
+        overview = item.get("overview") or ""
+        release_date = (
+            item.get("release_date") or item.get("first_air_date") or ""
+        )
+        vote_average = float(item.get("vote_average") or 0.0)
+        popularity = float(item.get("popularity") or 0.0)
+        poster_path = item.get("poster_path") or ""
+        genre_ids: list[int] = item.get("genre_ids") or []
+        genres = [genre_map.get(gid, "") for gid in genre_ids if gid in genre_map]
 
-        Returns a dict ``{"title": ..., "overview": ...}`` with the localized
-        strings, or empty strings if TMDB does not have a translation.
-
-        Design note
-        -----------
-        TMDB stores canonical technical metadata (cast, crew, keywords, providers)
-        independent of locale, so we fetch those once in English and only
-        overlay ``title`` and ``overview`` per locale.  This keeps the total
-        number of API calls at::
-
-            (1 English detail + N locales) per title
-
-        instead of the naive (N locales × full detail) approach.
-        """
-        endpoint = "movie" if media_type == "movie" else "tv"
-        url = f"{self.base_url}/{endpoint}/{tmdb_id}"
-        params = {"api_key": self.api_key, "language": language}
-        try:
-            resp = self._tmdb_get(url, params)
-            if resp.status_code == 200:
-                data = resp.json()
-                # TV uses 'name', movies use 'title'
-                title    = data.get("title") or data.get("name") or ""
-                overview = data.get("overview") or ""
-                return {"title": title, "overview": overview}
-        except Exception as exc:
-            logger.warning(
-                "[Locale] Could not fetch %s overlay for id=%s lang=%s: %s",
-                media_type, tmdb_id, language, exc,
-            )
-        return {"title": "", "overview": ""}
-
-    def discover_movies(self, page: int = 1, year_min: int = 2000, vote_min: float = 6.0) -> List[Dict]:
-        """Discover movies based on criteria."""
-        url = f"{self.base_url}/discover/movie"
-        params = {
-            "api_key": self.api_key,
-            "page": page,
-            "primary_release_date.gte": f"{year_min}-01-01",
-            "vote_average.gte": vote_min,
-            "sort_by": "popularity.desc",
-            "with_original_language": "en,hi,te,ta,es,fr,de,it,ja,ko,zh",
-        }
-        try:
-            resp = self._tmdb_get(url, params)
-            if resp.status_code == 200:
-                return resp.json().get("results", [])
-            print(f"Error discovering movies: {resp.status_code}")
-        except Exception as exc:
-            print(f"Exception in discover_movies: {exc}")
-        return []
-
-    def discover_tv_shows(self, page: int = 1, year_min: int = 2000, vote_min: float = 6.0) -> List[Dict]:
-        """Discover TV shows based on criteria."""
-        url = f"{self.base_url}/discover/tv"
-        params = {
-            "api_key": self.api_key,
-            "page": page,
-            "first_air_date.gte": f"{year_min}-01-01",
-            "vote_average.gte": vote_min,
-            "sort_by": "popularity.desc",
-            "with_original_language": "en,hi,te,ta,es,fr,de,it,ja,ko,zh",
-        }
-        try:
-            resp = self._tmdb_get(url, params)
-            if resp.status_code == 200:
-                return resp.json().get("results", [])
-            print(f"Error discovering TV shows: {resp.status_code}")
-        except Exception as exc:
-            print(f"Exception in discover_tv_shows: {exc}")
-        return []
-
-    def extract_genres(self, genres: List[Dict]) -> List[str]:
-        """Extract genre names from genre objects"""
-        return [genre["name"] for genre in genres if "name" in genre]
-    
-    def extract_cast(self, credits: Dict, limit: int = 5) -> List[str]:
-        """Extract main cast members"""
-        cast = credits.get("cast", [])[:limit]
-        return [actor["name"] for actor in cast if "name" in actor]
-    
-    def extract_director(self, credits: Dict) -> Optional[str]:
-        """Extract director name from credits"""
-        crew = credits.get("crew", [])
-        directors = [person["name"] for person in crew if person.get("job") == "Director"]
-        return directors[0] if directors else None
-    
-    def extract_streaming_platforms(self, watch_providers: Dict, region: str = "US") -> List[str]:
-        """Extract available streaming platforms"""
-        platforms = []
-        if "results" in watch_providers and region in watch_providers["results"]:
-            region_data = watch_providers["results"][region]
-            
-            # Get flatrate (subscription) services
-            if "flatrate" in region_data:
-                platforms.extend([provider["provider_name"] for provider in region_data["flatrate"]])
-            
-            # Get free services
-            if "free" in region_data:
-                platforms.extend([provider["provider_name"] for provider in region_data["free"]])
-            
-            # Get rental services (if no subscription available)
-            if not platforms and "rent" in region_data:
-                platforms.extend([provider["provider_name"] for provider in region_data["rent"]])
-        
-        return list(set(platforms))  # Remove duplicates
-    
-    def process_movie_data(
-        self,
-        movie_data: Dict,
-        locale: str = "en-US",
-        localized_data: Optional[Dict[str, str]] = None,
-    ) -> Dict:
-        """
-        Process raw movie data into a standardised row.
-
-        Parameters
-        ----------
-        movie_data      : Full TMDB movie detail response (English).
-        locale          : BCP-47 locale tag for this row (e.g. ``"hi-IN"``).
-        localized_data  : Dict with ``title`` and ``overview`` from the locale
-                          overlay call.  Falls back to the English values when
-                          the localized strings are empty.
-        """
-        loc = localized_data or {}
-        en_title    = movie_data.get("title", "")
-        en_overview = movie_data.get("overview", "")
-        return {
-            "id":                  movie_data.get("id"),
-            "tmdb_id":             movie_data.get("id"),
-            "title":               loc.get("title") or en_title,
-            "title_en":            en_title,
-            "overview":            loc.get("overview") or en_overview,
-            "overview_en":         en_overview,
-            "locale":              locale,
-            "release_date":        movie_data.get("release_date", ""),
-            "rating":              movie_data.get("vote_average", 0.0),
-            "poster_path":         movie_data.get("poster_path", ""),
-            "media_type":          "movie",
-            "original_language":   movie_data.get("original_language", "en"),
-            "runtime":             movie_data.get("runtime"),
-            "budget":              movie_data.get("budget"),
-            "revenue":             movie_data.get("revenue"),
-            "status":              movie_data.get("status", "released"),
-            "tagline":             movie_data.get("tagline", ""),
-            "genres":              self.extract_genres(movie_data.get("genres", [])),
-            "cast":                self.extract_cast(movie_data.get("credits", {})),
-            "director":            self.extract_director(movie_data.get("credits", {})),
-            "streaming_platforms": self.extract_streaming_platforms(movie_data.get("watch/providers", {})),
-            "popularity":          movie_data.get("popularity", 0.0),
-            "imdb_id":             movie_data.get("imdb_id", ""),
-            "keywords":            [kw["name"] for kw in movie_data.get("keywords", {}).get("keywords", [])],
-        }
-    
-    def process_tv_show_data(
-        self,
-        tv_data: Dict,
-        locale: str = "en-US",
-        localized_data: Optional[Dict[str, str]] = None,
-    ) -> Dict:
-        """
-        Process raw TV show data into a standardised row.
-
-        Parameters
-        ----------
-        tv_data         : Full TMDB TV detail response (English).
-        locale          : BCP-47 locale tag for this row (e.g. ``"te-IN"``).
-        localized_data  : Dict with ``title`` and ``overview`` from the locale
-                          overlay call.  Falls back to the English values when
-                          the localized strings are empty.
-        """
-        loc = localized_data or {}
-        en_title    = tv_data.get("name", "")
-        en_overview = tv_data.get("overview", "")
-        return {
-            "id":                   tv_data.get("id"),
-            "tmdb_id":              tv_data.get("id"),
-            "title":                loc.get("title") or en_title,
-            "title_en":             en_title,
-            "overview":             loc.get("overview") or en_overview,
-            "overview_en":          en_overview,
-            "locale":               locale,
-            "release_date":         tv_data.get("first_air_date", ""),
-            "rating":               tv_data.get("vote_average", 0.0),
-            "poster_path":          tv_data.get("poster_path", ""),
-            "media_type":           "tv",
-            "original_language":    tv_data.get("original_language", "en"),
-            "runtime":              tv_data.get("episode_run_time", [None])[0] if tv_data.get("episode_run_time") else None,
-            "status":               tv_data.get("status", "released"),
-            "tagline":              tv_data.get("tagline", ""),
-            "genres":               self.extract_genres(tv_data.get("genres", [])),
-            "cast":                 self.extract_cast(tv_data.get("credits", {})),
-            "director":             self.extract_director(tv_data.get("credits", {})),
-            "streaming_platforms":  self.extract_streaming_platforms(tv_data.get("watch/providers", {})),
-            "popularity":           tv_data.get("popularity", 0.0),
-            "number_of_seasons":    tv_data.get("number_of_seasons"),
-            "number_of_episodes":   tv_data.get("number_of_episodes"),
-            "keywords":             [kw["name"] for kw in tv_data.get("keywords", {}).get("results", [])],
-        }
-    
-    def collect_comprehensive_dataset(
-        self,
-        target_size: int = 10000,
-        batch_size: int = 20,
-        locales: Optional[List[str]] = None,
-    ) -> pd.DataFrame:
-        """
-        Collect a multilingual dataset of movies and TV shows.
-
-        For each unique TMDB title found:
-        1. Fetch full English details once (credits, keywords, providers).
-        2. For every locale in *locales*, call ``get_localized_overlay`` to get
-           the translated title and overview in a single lightweight API call.
-        3. Produce one row per ``(tmdb_id, locale)`` in the output DataFrame.
-
-        The output DataFrame contains:
-        - ``title`` / ``overview``     — in the row's locale (falls back to English
-          when TMDB has no translation).
-        - ``title_en`` / ``overview_en``  — always the English original.
-        - ``locale``                   — BCP-47 locale tag ("en-US", "hi-IN", "te-IN").
-
-        Parameters
-        ----------
-        target_size : Maximum rows **per locale** to keep (sorted by popularity).
-        locales     : List of BCP-47 locale strings to collect.
-                      Default: ``["en-US", "hi-IN", "te-IN"]``.
-        """
-        if locales is None:
-            locales = ["en-US", "hi-IN", "te-IN"]
-
-        all_media: list = []
-
-        print(f"Starting multilingual data collection for locales: {locales}")
-        print(f"Targeting {target_size} rows per locale → ~{target_size * len(locales)} total rows.")
-
-        # ── Step 1: Discover unique TMDB IDs (locale-independent) ────────────
-        print("\n[1/3] Collecting trending content IDs...")
-        trending_movie_ids: set = set()
-        trending_tv_ids:    set = set()
-
-        for page in range(1, 6):
-            for m in self.get_trending_movies("week", page):
-                trending_movie_ids.add(m["id"])
-            for t in self.get_trending_tv_shows("week", page):
-                trending_tv_ids.add(t["id"])
-
-        print(f"    {len(trending_movie_ids)} trending movies, {len(trending_tv_ids)} trending TV shows.")
-
-        print("[1/3] Discovering high-rated content...")
-        discovered_movie_ids: set = set()
-        discovered_tv_ids:    set = set()
-
-        for page in range(1, 21):
-            for m in self.discover_movies(page, year_min=2010, vote_min=7.0):
-                discovered_movie_ids.add(m["id"])
-            for t in self.discover_tv_shows(page, year_min=2010, vote_min=7.0):
-                discovered_tv_ids.add(t["id"])
-            if page % 5 == 0:
-                print(f"    Completed {page}/20 discovery pages...")
-
-        all_movie_ids = list(trending_movie_ids | discovered_movie_ids)
-        all_tv_ids    = list(trending_tv_ids    | discovered_tv_ids)
-        print(f"    {len(all_movie_ids)} unique movies, {len(all_tv_ids)} unique TV shows.")
-
-        # ── Step 2: Fetch full English details once per ID ────────────────────
-        print("\n[2/3] Fetching full English details (credits, keywords, providers)...")
-
-        # English base detail cache: tmdb_id -> raw TMDB response
-        movie_details_cache: dict = {}
-        tv_details_cache:    dict = {}
-
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(self.get_movie_details, mid, "en-US"): mid
-                for mid in all_movie_ids[:5000]
-            }
-            for future in as_completed(futures):
-                data = future.result()
-                if (
-                    data
-                    and data.get("overview")
-                    and data.get("vote_average", 0) > 5.0
-                ):
-                    movie_details_cache[data["id"]] = data
-
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {
-                executor.submit(self.get_tv_show_details, tid, "en-US"): tid
-                for tid in all_tv_ids[:5000]
-            }
-            for future in as_completed(futures):
-                data = future.result()
-                if (
-                    data
-                    and data.get("overview")
-                    and data.get("vote_average", 0) > 5.0
-                ):
-                    tv_details_cache[data["id"]] = data
-
-        print(
-            f"    Cached {len(movie_details_cache)} movies and "
-            f"{len(tv_details_cache)} TV shows in English."
+        cast_names, platforms = await asyncio.gather(
+            fetch_credits(session, media_type, tmdb_id),
+            fetch_watch_providers(session, media_type, tmdb_id),
         )
 
-        # ── Step 3: For each locale, overlay title+overview and build rows ─────
-        print("\n[3/3] Generating localized rows...")
+        raw = RawMedia(
+            tmdb_id=tmdb_id,
+            title=title,
+            media_type=media_type,
+            overview=overview,
+            genres=genres,
+            cast_names=cast_names,
+            release_date=release_date,
+            vote_average=vote_average,
+            popularity=popularity,
+            poster_path=poster_path,
+            platforms=platforms,
+        )
+        raw.build_embedding_text()
+        all_items.append(raw)
 
-        locale_frames: list = []
-
-        for locale in locales:
-            print(f"\n  Locale: {locale}")
-            locale_rows: list = []
-
-            # Movies
-            def _fetch_movie_locale(mid_data, _locale=locale):
-                mid, en_data = mid_data
-                if _locale == "en-US":
-                    overlay = {
-                        "title":    en_data.get("title", ""),
-                        "overview": en_data.get("overview", ""),
-                    }
-                else:
-                    overlay = self.get_localized_overlay(mid, "movie", _locale)
-                return self.process_movie_data(en_data, locale=_locale, localized_data=overlay)
-
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                m_futures = [
-                    executor.submit(_fetch_movie_locale, item)
-                    for item in movie_details_cache.items()
-                ]
-                for future in as_completed(m_futures):
-                    result = future.result()
-                    if result:
-                        locale_rows.append(result)
-
-            # TV shows
-            def _fetch_tv_locale(tid_data, _locale=locale):
-                tid, en_data = tid_data
-                if _locale == "en-US":
-                    overlay = {
-                        "title":    en_data.get("name", ""),
-                        "overview": en_data.get("overview", ""),
-                    }
-                else:
-                    overlay = self.get_localized_overlay(tid, "tv", _locale)
-                return self.process_tv_show_data(en_data, locale=_locale, localized_data=overlay)
-
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                t_futures = [
-                    executor.submit(_fetch_tv_locale, item)
-                    for item in tv_details_cache.items()
-                ]
-                for future in as_completed(t_futures):
-                    result = future.result()
-                    if result:
-                        locale_rows.append(result)
-
-            # Sort and cap per locale
-            locale_df = pd.DataFrame(locale_rows)
-            if not locale_df.empty:
-                locale_df["popularity_score"] = locale_df["popularity"].fillna(0)
-                locale_df = locale_df.sort_values(
-                    ["popularity_score", "rating"], ascending=[False, False]
-                )
-                if len(locale_df) > target_size:
-                    locale_df = locale_df.head(target_size)
-
-            print(f"    {len(locale_df)} rows for locale '{locale}'.")
-            locale_frames.append(locale_df)
-
-        # ── Combine all locales ────────────────────────────────────────────────
-        df = pd.concat(locale_frames, ignore_index=True) if locale_frames else pd.DataFrame()
-        df["trending_score"] = 0.0
-        df["last_updated"]   = datetime.utcnow()
-
-        print(f"\nFinal multilingual dataset: {len(df)} rows across {len(locales)} locales.")
-        return df
+        total_so_far = len(all_items)
+        if total_so_far % PROGRESS_EVERY == 0:
+            logger.info("Collected %d unique titles so far …", total_so_far)
 
 
-    def save_dataset(self, df: pd.DataFrame, output_path: str = "../data/enhanced_dataset.csv"):
-        """Save the collected multilingual dataset to CSV files."""
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        df.to_csv(output_path, index=False)
-        print(f"Dataset saved to {output_path}")
+async def _sweep_endpoint(
+    session: aiohttp.ClientSession,
+    label: str,
+    path: str,
+    max_pages: int,
+    media_type: str,
+    genre_map: dict[int, str],
+    all_items: list["RawMedia"],
+    seen_ids: set[tuple[str, int]],
+    extra_params: dict[str, Any] | None = None,
+) -> None:
+    """
+    Generic helper: iterate ``max_pages`` pages of a TMDB list endpoint,
+    using the same tenacity retry logic as ``fetch_page``.
+    """
+    logger.info("[sweep] %s — %d pages …", label, max_pages)
+    for page in range(1, max_pages + 1):
+        params: dict[str, Any] = {"page": page}
+        if extra_params:
+            params.update(extra_params)
+        try:
+            data = await _get_json(session, path, params)
+            results = data.get("results", [])
+        except Exception as exc:
+            logger.warning("[sweep] %s page %d skipped after retries: %s", label, page, exc)
+            continue
+        await _ingest_results(session, results, media_type, genre_map, all_items, seen_ids)
+        await asyncio.sleep(0.05)   # respect TMDB rate limit
+    logger.info("[sweep] %s done. Running total: %d unique titles.", label, len(all_items))
 
-        # Per-media-type splits
-        movies_df = df[df["media_type"] == "movie"]
-        tv_df     = df[df["media_type"] == "tv"]
-        movies_df.to_csv("../data/enhanced_movies.csv", index=False)
-        tv_df.to_csv("../data/enhanced_tv_shows.csv", index=False)
-        print(f"Saved {len(movies_df)} movie rows and {len(tv_df)} TV show rows.")
 
-        # Per-locale splits (useful for locale-specific ingestion)
-        if "locale" in df.columns:
-            for locale in df["locale"].unique():
-                locale_path = os.path.join(
-                    os.path.dirname(output_path),
-                    f"enhanced_dataset_{locale.replace('-', '_')}.csv",
-                )
-                df[df["locale"] == locale].to_csv(locale_path, index=False)
-            print(f"Saved per-locale CSV files for: {list(df['locale'].unique())}")
+async def collect_all_items(
+    session: aiohttp.ClientSession,
+    genre_map: dict[int, str],
+) -> list[RawMedia]:
+    """
+    Collect 10,000+ unique movies and TV shows from TMDB by sweeping multiple
+    endpoints and genre-filtered discover queries.
 
-def main():
-    """Main function to collect comprehensive dataset"""
-    api_key = os.getenv("TMDB_API_KEY")
-    if not api_key:
-        print("Please set TMDB_API_KEY environment variable")
+    Sweep plan
+    ----------
+    Movies
+      - /movie/popular        500 pages  (~10 000 raw results)
+      - /movie/top_rated      200 pages  (high-quality back-catalogue)
+      - /movie/now_playing     50 pages  (theatrical releases)
+      - /movie/upcoming        50 pages  (unreleased / pre-release)
+      - /discover/movie       10 genres × 30 pages (genre diversity)
+
+    TV Shows
+      - /tv/popular           250 pages
+      - /tv/top_rated         200 pages
+
+    All results are deduplicated by (media_type, tmdb_id) so overlapping
+    titles across endpoints are counted only once.
+    """
+    all_items: list[RawMedia] = []
+    seen_ids: set[tuple[str, int]] = set()
+
+    # ── Movie sweeps ─────────────────────────────────────────────────────────
+    await _sweep_endpoint(
+        session, "movie/popular", "/movie/popular",
+        MOVIE_PAGES, "movie", genre_map, all_items, seen_ids,
+    )
+    await _sweep_endpoint(
+        session, "movie/top_rated", "/movie/top_rated",
+        MOVIE_TOP_RATED_PAGES, "movie", genre_map, all_items, seen_ids,
+    )
+    await _sweep_endpoint(
+        session, "movie/now_playing", "/movie/now_playing",
+        MOVIE_NOW_PLAYING_PAGES, "movie", genre_map, all_items, seen_ids,
+    )
+    await _sweep_endpoint(
+        session, "movie/upcoming", "/movie/upcoming",
+        MOVIE_UPCOMING_PAGES, "movie", genre_map, all_items, seen_ids,
+    )
+
+    # ── Discover sweeps (genre-filtered) ─────────────────────────────────────
+    for genre_id, pages in DISCOVER_GENRE_PAGES.items():
+        genre_name = genre_map.get(genre_id, str(genre_id))
+        await _sweep_endpoint(
+            session, f"discover/movie genre={genre_name}", "/discover/movie",
+            pages, "movie", genre_map, all_items, seen_ids,
+            extra_params={"with_genres": genre_id, "sort_by": "popularity.desc"},
+        )
+
+    # ── TV sweeps ─────────────────────────────────────────────────────────────
+    await _sweep_endpoint(
+        session, "tv/popular", "/tv/popular",
+        TV_PAGES, "tv", genre_map, all_items, seen_ids,
+    )
+    await _sweep_endpoint(
+        session, "tv/top_rated", "/tv/top_rated",
+        TV_TOP_RATED_PAGES, "tv", genre_map, all_items, seen_ids,
+    )
+
+    logger.info("Collection complete. Total unique titles: %d", len(all_items))
+    return all_items
+
+
+# ---------------------------------------------------------------------------
+# Embedding generation
+# ---------------------------------------------------------------------------
+
+def generate_embeddings(
+    model: SentenceTransformer,
+    items: list[RawMedia],
+) -> list[list[float]]:
+    """
+    Generate 384-dim embeddings for all items using the provided model.
+    Done in one batch call (sentence-transformers handles internal batching).
+    """
+    texts = [item.text_for_embedding for item in items]
+    logger.info("Generating embeddings for %d texts …", len(texts))
+    vectors = model.encode(
+        texts,
+        batch_size=64,
+        show_progress_bar=True,
+        normalize_embeddings=True,   # L2-normalise → cosine via dot product
+        convert_to_numpy=True,
+    )
+    logger.info("Embedding generation complete.")
+    return [v.tolist() for v in vectors]
+
+
+# ---------------------------------------------------------------------------
+# Popularity normalisation (min-max across the full batch)
+# ---------------------------------------------------------------------------
+
+def normalize_popularity(items: list[RawMedia]) -> list[float]:
+    """Return min-max normalised popularity scores in [0, 1]."""
+    scores = [item.popularity for item in items]
+    min_pop = min(scores) if scores else 0.0
+    max_pop = max(scores) if scores else 1.0
+    span = max_pop - min_pop or 1.0
+    return [(s - min_pop) / span for s in scores]
+
+
+# ---------------------------------------------------------------------------
+# Database upsert
+# ---------------------------------------------------------------------------
+
+async def upsert_batch(
+    db_session: AsyncSession,
+    batch: list[dict[str, Any]],
+) -> None:
+    """
+    Upsert a batch of media records using PostgreSQL ON CONFLICT DO UPDATE.
+    Conflict target: ``tmdb_id`` (unique column).
+    """
+    stmt = pg_insert(MediaTable).values(batch)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["tmdb_id"],
+        set_={
+            "title": stmt.excluded.title,
+            "media_type": stmt.excluded.media_type,
+            "overview": stmt.excluded.overview,
+            "genres": stmt.excluded.genres,
+            "cast_names": stmt.excluded.cast_names,
+            "release_date": stmt.excluded.release_date,
+            "vote_average": stmt.excluded.vote_average,
+            "popularity": stmt.excluded.popularity,
+            "poster_path": stmt.excluded.poster_path,
+            "platforms": stmt.excluded.platforms,
+            "embedding": stmt.excluded.embedding,
+        },
+    )
+    await db_session.execute(stmt)
+    await db_session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+async def main() -> None:
+    """
+    Orchestrates the full ingest pipeline:
+
+    1. Load env / model.
+    2. Collect all TMDB pages (with credits + watch providers).
+    3. Generate embeddings.
+    4. Normalise popularity scores.
+    5. Upsert into PostgreSQL in batches of ``BATCH_SIZE``.
+    """
+    # ------------------------------------------------------------------
+    # 1. Embedding model (loaded once — CPU friendly, ~280 MB RAM)
+    # ------------------------------------------------------------------
+    logger.info("Loading embedding model: %s", EMBED_MODEL_NAME)
+    model = SentenceTransformer(EMBED_MODEL_NAME)
+
+    # ------------------------------------------------------------------
+    # 2. DB engine (no pgvector extension needed at ingest time — already
+    #    created by init_db() on app startup)
+    # ------------------------------------------------------------------
+    engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    # Lazy-import the ORM table object to avoid circular deps when running
+    # as a standalone script vs. as part of the FastAPI app.
+    global MediaTable  # noqa: PLW0603
+    try:
+        from backend.models import Media  # FastAPI app context
+        MediaTable = Media.__table__
+    except ImportError:
+        from backend.models import Media  # standalone execution
+        MediaTable = Media.__table__
+
+    # ------------------------------------------------------------------
+    # 3. Collection
+    # ------------------------------------------------------------------
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout
+    ) as http_session:
+        genre_map = await build_genre_map(http_session)
+        logger.info("Genre map loaded: %d genres", len(genre_map))
+
+        all_items = await collect_all_items(http_session, genre_map)
+
+    if not all_items:
+        logger.error("No items collected — aborting.")
+        await engine.dispose()
         return
-    
-    collector = TMDBDataCollector(api_key)
-    
-    # Collect comprehensive dataset
-    df = collector.collect_comprehensive_dataset(target_size=12000)
-    
-    # Save the dataset
-    collector.save_dataset(df)
-    
-    # Print statistics
-    print("\nDataset Statistics:")
-    print(f"Total titles: {len(df)}")
-    print(f"Movies: {len(df[df['media_type'] == 'movie'])}")
-    print(f"TV Shows: {len(df[df['media_type'] == 'tv'])}")
-    print(f"Average rating: {df['rating'].mean():.2f}")
-    print(f"Languages: {df['original_language'].nunique()}")
-    print(f"Streaming platforms found: {df['streaming_platforms'].apply(lambda x: len(x) if isinstance(x, list) else 0).sum()}")
+
+    # ------------------------------------------------------------------
+    # 4. Embeddings
+    # ------------------------------------------------------------------
+    embeddings = generate_embeddings(model, all_items)
+
+    # ------------------------------------------------------------------
+    # 5. Popularity normalisation
+    # ------------------------------------------------------------------
+    norm_popularity = normalize_popularity(all_items)
+
+    # ------------------------------------------------------------------
+    # 6. Upsert in batches
+    # ------------------------------------------------------------------
+    total = len(all_items)
+    logger.info("Upserting %d records into PostgreSQL (batch size=%d) …", total, BATCH_SIZE)
+
+    processed = 0
+    async with session_factory() as db_session:
+        for start in range(0, total, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, total)
+            batch_items = all_items[start:end]
+            batch_embeddings = embeddings[start:end]
+            batch_norm_pop = norm_popularity[start:end]
+
+            batch_rows: list[dict[str, Any]] = []
+            for item, emb, norm_pop in zip(batch_items, batch_embeddings, batch_norm_pop):
+                batch_rows.append(
+                    {
+                        "tmdb_id": item.tmdb_id,
+                        "title": item.title,
+                        "media_type": item.media_type,
+                        "overview": item.overview,
+                        "genres": item.genres,
+                        "cast_names": item.cast_names,
+                        "release_date": item.release_date,
+                        "vote_average": item.vote_average,
+                        "popularity": norm_pop,   # store normalised value
+                        "poster_path": item.poster_path,
+                        "platforms": item.platforms,
+                        "embedding": emb,
+                    }
+                )
+
+            try:
+                await upsert_batch(db_session, batch_rows)
+            except Exception as exc:
+                logger.error("Upsert failed for batch %d–%d: %s", start, end, exc)
+                await db_session.rollback()
+                continue
+
+            processed += len(batch_rows)
+            if processed % PROGRESS_EVERY == 0 or processed == total:
+                logger.info("Processed %d/%d …", processed, total)
+
+    logger.info("Ingest complete. %d/%d records upserted.", processed, total)
+    await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Regional content sweep — Hindi / Telugu / Tamil
+# ---------------------------------------------------------------------------
+
+# Sweep plan: (language_code, endpoint, sort_by, n_pages, label)
+_REGIONAL_SWEEPS: list[tuple[str, str, str, int, str]] = [
+    # Hindi movies
+    ("hi", "/discover/movie", "popularity.desc",   100, "Bollywood/Popular"),
+    ("hi", "/discover/movie", "vote_average.desc",  50, "Bollywood/TopRated"),
+    ("hi", "/discover/tv",   "popularity.desc",    50, "Hindi TV/Popular"),
+    # Telugu movies
+    ("te", "/discover/movie", "popularity.desc",   80, "Tollywood/Popular"),
+    ("te", "/discover/movie", "vote_average.desc",  40, "Tollywood/TopRated"),
+    ("te", "/discover/tv",   "popularity.desc",    30, "Telugu TV/Popular"),
+    # Tamil movies (bonus)
+    ("ta", "/discover/movie", "popularity.desc",   50, "Kollywood/Popular"),
+]
+
+
+async def collect_regional_content(
+    session: aiohttp.ClientSession,
+    genre_map: dict[int, str],
+    all_items: list[RawMedia],
+    seen_ids: set[tuple[str, int]],
+) -> None:
+    """
+    Sweep TMDB /discover endpoints for Hindi, Telugu, and Tamil content,
+    requesting titles and overviews in the source language so the multilingual
+    embedding model (paraphrase-multilingual-MiniLM-L12-v2) receives authentic
+    native-script text rather than romanized or translated strings.
+
+    Results are merged into the shared ``all_items`` list and ``seen_ids`` set
+    so duplicates with the English sweep are automatically discarded.
+
+    Each ``RawMedia`` item produced here has ``original_language`` set to the
+    ISO 639-1 code (e.g. ``'hi'``, ``'te'``, ``'ta'``) so the DB column
+    ``media_language`` can be populated and later used for frontend filtering.
+    """
+    for lang_code, path, sort_by, n_pages, label in _REGIONAL_SWEEPS:
+        logger.info(
+            "[regional] %s (%s) — %d pages, sort=%s …",
+            label, lang_code, n_pages, sort_by,
+        )
+        for page in range(1, n_pages + 1):
+            params: dict[str, Any] = {
+                "page": page,
+                "with_original_language": lang_code,
+                "sort_by": sort_by,
+                # Request TMDB metadata in the source language so titles /
+                # overviews come back in native script where TMDB has them.
+                "language": lang_code,
+                "vote_count.gte": 10,   # filter out obscure zero-vote entries
+            }
+
+            # Determine media_type from path
+            media_type = "tv" if "/discover/tv" in path else "movie"
+
+            try:
+                data = await _get_json(session, path, params)
+                results = data.get("results", [])
+            except Exception as exc:
+                logger.warning(
+                    "[regional] %s page %d skipped: %s", label, page, exc
+                )
+                await asyncio.sleep(0.1)
+                continue
+
+            for item in results:
+                tmdb_id: int = item.get("id", 0)
+                if not tmdb_id:
+                    continue
+                key = (media_type, tmdb_id)
+                if key in seen_ids:
+                    continue
+                seen_ids.add(key)
+
+                # Prefer native-script title; fall back to localized/English title
+                original_title: str = (
+                    item.get("original_title") or item.get("original_name") or ""
+                ).strip()
+                title: str = (
+                    item.get("title") or item.get("name") or original_title
+                ).strip()
+                overview: str = (item.get("overview") or "").strip()
+                release_date: str = (
+                    item.get("release_date") or item.get("first_air_date") or ""
+                )
+                vote_average = float(item.get("vote_average") or 0.0)
+                popularity    = float(item.get("popularity") or 0.0)
+                poster_path: str = item.get("poster_path") or ""
+                genre_ids: list[int] = item.get("genre_ids") or []
+                genres = [
+                    genre_map.get(gid, "")
+                    for gid in genre_ids
+                    if gid in genre_map
+                ]
+
+                cast_names, platforms = await asyncio.gather(
+                    fetch_credits(session, media_type, tmdb_id),
+                    fetch_watch_providers(session, media_type, tmdb_id),
+                )
+
+                raw = RawMedia(
+                    tmdb_id=tmdb_id,
+                    title=title,
+                    media_type=media_type,
+                    overview=overview,
+                    genres=genres,
+                    cast_names=cast_names,
+                    release_date=release_date,
+                    vote_average=vote_average,
+                    popularity=popularity,
+                    poster_path=poster_path,
+                    platforms=platforms,
+                    original_language=lang_code,
+                    original_title=original_title,
+                )
+                raw.build_embedding_text()
+                all_items.append(raw)
+
+                total = len(all_items)
+                if total % PROGRESS_EVERY == 0:
+                    logger.info(
+                        "[regional] Collected %d unique titles so far …", total
+                    )
+
+            await asyncio.sleep(0.05)   # stay within TMDB rate limit
+
+        logger.info(
+            "[regional] %s done. Running total: %d unique titles.",
+            label, len(all_items),
+        )
+
+    logger.info(
+        "[regional] All regional sweeps complete. Final unique titles: %d",
+        len(all_items),
+    )
+
+
+async def main() -> None:
+    """
+    Full ingestion pipeline:
+      1. English content (popular / top-rated / now-playing / upcoming / genre sweeps)
+      2. Regional content (Hindi / Telugu / Tamil)
+      3. Embed all unique titles and upsert into PostgreSQL.
+    """
+    # ------------------------------------------------------------------
+    # 1. Embedding model (loaded once — CPU friendly, ~280 MB RAM)
+    # ------------------------------------------------------------------
+    logger.info("Loading embedding model: %s", EMBED_MODEL_NAME)
+    model = SentenceTransformer(EMBED_MODEL_NAME)
+
+    # ------------------------------------------------------------------
+    # 2. DB engine (no pgvector extension needed at ingest time — already
+    #    created by init_db() on app startup)
+    # ------------------------------------------------------------------
+    engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    # Lazy-import the ORM table object to avoid circular deps when running
+    # as a standalone script vs. as part of the FastAPI app.
+    global MediaTable  # noqa: PLW0603
+    try:
+        from backend.models import Media  # FastAPI app context
+        MediaTable = Media.__table__
+    except ImportError:
+        from backend.models import Media  # standalone execution
+        MediaTable = Media.__table__
+
+    # ------------------------------------------------------------------
+    # 3. Collection
+    # ------------------------------------------------------------------
+    connector = aiohttp.TCPConnector(limit=20, ttl_dns_cache=300)
+    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout
+    ) as http_session:
+        genre_map = await build_genre_map(http_session)
+        logger.info("Genre map loaded: %d genres", len(genre_map))
+
+        all_items = await collect_all_items(http_session, genre_map)
+
+    if not all_items:
+        logger.error("No items collected — aborting.")
+        await engine.dispose()
+        return
+
+    # ------------------------------------------------------------------
+    # 4. Embeddings
+    # ------------------------------------------------------------------
+    embeddings = generate_embeddings(model, all_items)
+
+    # ------------------------------------------------------------------
+    # 5. Popularity normalisation
+    # ------------------------------------------------------------------
+    norm_popularity = normalize_popularity(all_items)
+
+    # ------------------------------------------------------------------
+    # 6. Upsert in batches
+    # ------------------------------------------------------------------
+    total = len(all_items)
+    logger.info("Upserting %d records into PostgreSQL (batch size=%d) …", total, BATCH_SIZE)
+
+    processed = 0
+    async with session_factory() as db_session:
+        for start in range(0, total, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, total)
+            batch_items = all_items[start:end]
+            batch_embeddings = embeddings[start:end]
+            batch_norm_pop = norm_popularity[start:end]
+
+            batch_rows: list[dict[str, Any]] = []
+            for item, emb, norm_pop in zip(batch_items, batch_embeddings, batch_norm_pop):
+                batch_rows.append(
+                    {
+                        "tmdb_id": item.tmdb_id,
+                        "title": item.title,
+                        "media_type": item.media_type,
+                        "overview": item.overview,
+                        "genres": item.genres,
+                        "cast_names": item.cast_names,
+                        "release_date": item.release_date,
+                        "vote_average": item.vote_average,
+                        "popularity": norm_pop,   # store normalised value
+                        "poster_path": item.poster_path,
+                        "platforms": item.platforms,
+                        "embedding": emb,
+                    }
+                )
+
+            try:
+                await upsert_batch(db_session, batch_rows)
+            except Exception as exc:
+                logger.error("Upsert failed for batch %d–%d: %s", start, end, exc)
+                await db_session.rollback()
+                continue
+
+            processed += len(batch_rows)
+            if processed % PROGRESS_EVERY == 0 or processed == total:
+                logger.info("Processed %d/%d …", processed, total)
+
+    logger.info("Ingest complete. %d/%d records upserted.", processed, total)
+    await engine.dispose()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

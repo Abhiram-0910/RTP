@@ -1,8 +1,31 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Link } from 'react-router-dom';
+import { motion, AnimatePresence } from 'framer-motion';
 import toast from 'react-hot-toast';
-import { Star, Film, X, AlertCircle, Loader2 } from 'lucide-react';
+import { Star, Film, X, AlertCircle, Loader2, Heart, ThumbsDown, Bookmark, Compass } from 'lucide-react';
 import api from '../services/api';
+
+const StatCard = ({ label, value, icon: Icon, color, loading }) => (
+  <motion.div
+    initial={{ opacity: 0, y: 20 }}
+    animate={{ opacity: 1, y: 0 }}
+    className="glass-card rounded-2xl p-6 transition-all hover:shadow-card-hover group"
+  >
+    {loading ? (
+      <div className="h-12 shimmer bg-midnight-800 rounded" />
+    ) : (
+      <>
+        <div className="flex items-center gap-2 mb-3">
+          <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${color} bg-opacity-10`}>
+            <Icon size={16} />
+          </div>
+          <p className="text-slate-500 text-[11px] font-semibold uppercase tracking-[0.15em] font-body">{label}</p>
+        </div>
+        <p className={`text-4xl font-display font-bold ${color}`}>{value}</p>
+      </>
+    )}
+  </motion.div>
+);
 
 const Watchlist = () => {
   const [stats, setStats]       = useState({ movies_liked: 0, movies_disliked: 0, watchlist_size: 0 });
@@ -45,9 +68,9 @@ const Watchlist = () => {
   if (isError) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center py-24 px-4 gap-4">
-        <AlertCircle size={48} className="text-red-500" />
-        <h3 className="text-xl font-bold text-white">Failed to load watchlist</h3>
-        <button onClick={fetchData} className="text-blue-400 hover:text-blue-300 text-sm underline">
+        <AlertCircle size={48} className="text-cinema-crimson" />
+        <h3 className="text-xl font-display font-bold text-white">Failed to load watchlist</h3>
+        <button onClick={fetchData} className="text-accent hover:text-accent-light text-sm underline font-body">
           Try again
         </button>
       </div>
@@ -55,83 +78,100 @@ const Watchlist = () => {
   }
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-8">
-      <h1 className="text-2xl font-bold text-white mb-6">Your Archive</h1>
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-10">
+      <motion.div
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        className="mb-8"
+      >
+        <h1 className="text-3xl font-display font-bold text-white mb-2">
+          Your <span className="text-gradient">Archive</span>
+        </h1>
+        <p className="text-slate-500 text-sm font-body">Track your cinematic journey</p>
+      </motion.div>
 
       {/* ── Stats ─────────────────────────────────────────────────────────── */}
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-8">
-        {[
-          { label: 'Loved', value: stats.movies_liked,    color: 'text-rose-400',   border: 'hover:border-rose-500/40' },
-          { label: 'Passed', value: stats.movies_disliked, color: 'text-slate-400', border: 'hover:border-slate-500/40' },
-          { label: 'Watchlist', value: stats.watchlist_size, color: 'text-blue-400', border: 'hover:border-blue-500/40' },
-        ].map(({ label, value, color, border }) => (
-          <div key={label}
-            className={`bg-slate-900/60 border border-slate-800 ${border} rounded-2xl p-6 transition-all`}
-          >
-            {loading ? (
-              <div className="h-10 bg-slate-800 animate-pulse rounded" />
-            ) : (
-              <>
-                <p className="text-slate-500 text-xs font-semibold uppercase tracking-wider mb-2">{label}</p>
-                <p className={`text-4xl font-bold ${color}`}>{value}</p>
-              </>
-            )}
-          </div>
-        ))}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-10">
+        <StatCard label="Loved" value={stats.movies_liked} icon={Heart} color="text-cinema-crimson" loading={loading} />
+        <StatCard label="Passed" value={stats.movies_disliked} icon={ThumbsDown} color="text-slate-400" loading={loading} />
+        <StatCard label="Watchlist" value={stats.watchlist_size} icon={Bookmark} color="text-accent" loading={loading} />
       </div>
 
       {/* ── Watchlist grid ────────────────────────────────────────────────── */}
       {loading ? (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6 gap-4">
           {Array.from({ length: 6 }).map((_, i) => (
-            <div key={i} className="aspect-[2/3] bg-slate-800 rounded-2xl animate-pulse" />
+            <div key={i} className="aspect-[2/3] shimmer bg-midnight-800 rounded-2xl" />
           ))}
         </div>
       ) : watchlist.length === 0 ? (
-        <section className="flex flex-col items-center justify-center py-24 border border-dashed border-slate-700 rounded-2xl gap-6">
-          <div className="relative size-28">
-            <div className="absolute inset-0 bg-blue-500/10 rounded-full blur-2xl" />
-            <div className="relative size-full rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center">
-              <Film size={44} className="text-blue-500" />
+        <motion.section
+          initial={{ opacity: 0, scale: 0.95 }}
+          animate={{ opacity: 1, scale: 1 }}
+          className="flex flex-col items-center justify-center py-24 glass-card rounded-3xl gap-6"
+        >
+          <div className="relative w-28 h-28">
+            <div className="absolute inset-0 bg-accent/10 rounded-full blur-2xl animate-glow-pulse" />
+            <div className="relative w-full h-full rounded-full bg-midnight-800 border border-white/10 flex items-center justify-center">
+              <Film size={44} className="text-accent animate-float" />
             </div>
           </div>
           <div className="text-center">
-            <h3 className="text-white text-xl font-bold mb-2">Your watchlist is empty</h3>
-            <p className="text-slate-400 text-sm">Save movies to watch later using the 🔖 button on any card.</p>
+            <h3 className="text-white text-xl font-display font-bold mb-2">Your watchlist is empty</h3>
+            <p className="text-slate-400 text-sm font-body">Save movies to watch later using the 🔖 button on any card.</p>
           </div>
-          <Link to="/" className="bg-blue-600 hover:bg-blue-500 text-white font-semibold px-6 py-2.5 rounded-xl transition-all">
-            Discover Movies
+          <Link
+            to="/"
+            className="bg-gradient-to-r from-accent to-accent-light hover:from-accent-light hover:to-accent text-midnight-950 font-display font-bold px-6 py-2.5 rounded-xl transition-all shadow-glow-sm flex items-center gap-2"
+          >
+            <Compass size={16} /> Discover Movies
           </Link>
-        </section>
+        </motion.section>
       ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-4">
-          {watchlist.map((item) => (
-            <div key={item.id} className="group relative aspect-[2/3] bg-slate-800 rounded-2xl overflow-hidden border border-slate-800 hover:border-slate-700 transition-all">
-              {item.poster_path ? (
-                <img src={item.poster_path} alt={item.title} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center">
-                  <Film size={36} className="text-slate-600" />
-                </div>
-              )}
-              {/* Hover overlay */}
-              <div className="absolute inset-0 bg-black/70 backdrop-blur-sm opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center gap-3 p-3 text-center">
-                <p className="text-white font-semibold text-sm leading-tight line-clamp-3">{item.title}</p>
-                {item.rating && (
-                  <span className="flex items-center gap-1 text-amber-400 text-xs">
-                    <Star size={10} fill="currentColor" /> {item.rating?.toFixed(1)}
-                  </span>
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-5">
+          <AnimatePresence>
+            {watchlist.map((item, index) => (
+              <motion.div
+                key={item.id}
+                layout
+                initial={{ opacity: 0, scale: 0.9 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.8, transition: { duration: 0.3 } }}
+                transition={{ delay: index * 0.04 }}
+                className="group relative aspect-[2/3] glass-card gradient-border rounded-2xl overflow-hidden"
+              >
+                {item.poster_path ? (
+                  <img
+                    src={item.poster_path}
+                    alt={item.title}
+                    className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700 ease-out"
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center bg-midnight-800">
+                    <Film size={36} className="text-slate-700" />
+                  </div>
                 )}
-                <button
-                  onClick={() => removeItem(item.id, item.title)}
-                  className="w-9 h-9 rounded-full bg-white/10 hover:bg-red-500 flex items-center justify-center text-white transition-colors"
-                  title="Remove from Watchlist"
-                >
-                  <X size={16} />
-                </button>
-              </div>
-            </div>
-          ))}
+                {/* Hover overlay */}
+                <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col items-center justify-end p-4 text-center gap-2">
+                  <p className="text-white font-display font-semibold text-sm leading-tight line-clamp-2">{item.title}</p>
+                  {item.rating && (
+                    <span className="flex items-center gap-1 text-accent text-xs font-body">
+                      <Star size={10} fill="currentColor" /> {item.rating?.toFixed(1)}
+                    </span>
+                  )}
+                  <motion.button
+                    whileHover={{ scale: 1.1 }}
+                    whileTap={{ scale: 0.9 }}
+                    onClick={() => removeItem(item.id, item.title)}
+                    className="w-9 h-9 rounded-full bg-white/10 hover:bg-cinema-crimson border border-white/10 hover:border-cinema-crimson flex items-center justify-center text-white transition-all mt-1"
+                    title="Remove from Watchlist"
+                  >
+                    <X size={16} />
+                  </motion.button>
+                </div>
+              </motion.div>
+            ))}
+          </AnimatePresence>
         </div>
       )}
     </div>

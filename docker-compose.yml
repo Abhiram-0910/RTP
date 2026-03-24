@@ -1,34 +1,22 @@
-version: "3.9"
-
-# ── Movie and TV Shows Recommending Engine — Optional Services ─────────────────────────────────────────────────
-# Run Redis (required for Celery background tasks and optional Redis caching).
-#
-# Windows / Mac / Linux:
-#   docker compose up -d redis
-#
-# Then start the Celery worker (in a separate terminal):
-#   cd backend
-#   ..\venv\Scripts\celery -A tasks worker --loglevel=info --pool=solo
-#
-# Without Docker, the app works fine — it degrades gracefully to FastAPI
-# BackgroundTasks and SQLite-based recommendation caching.
+version: '3.8'
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: mirai_redis
-    restart: unless-stopped
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: mirai_postgres
     ports:
-      - "6379:6379"
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: mirai_db
+      POSTGRES_USER: mirai
+      POSTGRES_PASSWORD: mirai_pass
     volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U mirai"]
+      interval: 5s
       timeout: 5s
-      retries: 3
+      retries: 5
 
 volumes:
-  redis_data:
-    driver: local
+  postgres_data:

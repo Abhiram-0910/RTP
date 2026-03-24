@@ -63,10 +63,8 @@ def seed_from_csv():
     except Exception as e:
         print(f"Error dropping tables: {e}")
         
-    print("Creating new tables...")
     try:
         init_enhanced_db()
-        print("Tables created successfully.")
     except Exception as e:
         print(f"Warning during init: {e}")
         Base.metadata.create_all(bind=engine)

@@ -2,6 +2,11 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, Text, Bool
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.sql import func
+try:
+    from pgvector.sqlalchemy import Vector
+except ImportError:
+    Vector = None
+
 import os
 from dotenv import load_dotenv
 from datetime import datetime
@@ -9,6 +14,9 @@ from datetime import datetime
 load_dotenv()
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./mirai.db")
+if "+asyncpg" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("+asyncpg", "+psycopg2")
+print(f"[DB_DEBUG] Using DATABASE_URL: {DATABASE_URL}")
 
 # SQLite requires special pool settings; PostgreSQL uses standard pooling
 if DATABASE_URL.startswith("sqlite"):
@@ -90,6 +98,9 @@ class Media(Base):
     # Recommendation & trending features
     popularity_score = Column(Float, default=0.0)
     trending_score = Column(Float, default=0.0)
+    # Vector storage moved to local FAISS for MIRAI-RAG orchestration
+    # embedding = Column(Vector(384))
+    # embedding_gemini = Column(Vector(768), nullable=True)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Aggregated review text for embedding enrichment (critic + user snippets)
@@ -208,7 +219,7 @@ def init_enhanced_db():
     Base.metadata.create_all(bind=engine)
 
     from sqlalchemy import text
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         # Full-text search indexes for PostgreSQL only
         if DATABASE_URL.startswith("postgresql"):
             conn.execute(text("""
@@ -229,7 +240,6 @@ def init_enhanced_db():
             CREATE INDEX IF NOT EXISTS idx_media_popularity
             ON media(popularity_score DESC, trending_score DESC);
         """))
-        conn.commit()
 
 
 def get_db():

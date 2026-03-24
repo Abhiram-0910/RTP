@@ -9,7 +9,7 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-from database import SessionLocal, Media, Base, engine
+from backend.database import SessionLocal, Media, Base, engine
 
 def seed():
     # Ensure Media table exists

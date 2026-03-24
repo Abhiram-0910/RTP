@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from passlib.context import CryptContext
-from database import SessionLocal, User, Base, engine
+from backend.database import SessionLocal, User, Base, engine
 
 # Ensure tables exist
 Base.metadata.create_all(bind=engine)

@@ -10,11 +10,11 @@ export default defineConfig({
       // This makes them same-origin from the browser's perspective,
       // completely bypassing CORS for local development.
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8005',
         changeOrigin: true,
       },
       '/token': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8005',
         changeOrigin: true,
       },
     },

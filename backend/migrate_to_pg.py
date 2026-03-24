@@ -1,6 +1,6 @@
 import pandas as pd
 import os
-from database import SessionLocal, Media, engine, Base
+from backend.database import SessionLocal, Media, engine, Base
 import sys
 import io
 

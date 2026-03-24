@@ -145,7 +145,7 @@ def _get_db():
     """Return a SQLAlchemy session from the project's database module."""
     # Import inside the function so the Celery module can be imported
     # without the full FastAPI application stack being initialised.
-    from database import SessionLocal
+    from backend.database import SessionLocal
     return SessionLocal()
 
 
@@ -185,7 +185,7 @@ def update_trending_and_providers(self) -> dict[str, Any]:
     Returns a summary dict logged to Celery's result backend.
     """
     import requests as http_requests
-    from database import Media  # local import — avoids FastAPI startup side-effects
+    from backend.database import Media  # local import — avoids FastAPI startup side-effects
 
     if not _TMDB_API_KEY:
         logger.error("[update_trending_and_providers] TMDB_API_KEY is not set — aborting.")
@@ -329,7 +329,7 @@ def update_trending_and_providers(self) -> dict[str, Any]:
                                 "type":       stream_type,
                                 "region":     region,
                                 "logo_path":  p.get("logo_path"),
-                                "source":     "JustWatch via TMDB",
+                                "source":     "TMDB Watch Providers",
                             })
 
                 if rc is not None:
@@ -495,7 +495,7 @@ def train_als_model_task(self) -> dict[str, Any]:
     start = datetime.now(timezone.utc)
 
     # ── Step 1: Fetch all interactions from the database ──────────────────────
-    from database import Interaction
+    from backend.database import Interaction
     db = _get_db()
     _RATING_MAP = {"like": 4.0, "love": 5.0, "watch": 3.5,
                    "dislike": 1.0, "skip": 2.0}

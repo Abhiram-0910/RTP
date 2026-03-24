@@ -90,11 +90,11 @@ movie-rec-project/
 │   ├── movies_metadata.csv       # Movie metadata
 │   └── tmdb_5000_movies.csv      # Original dataset
 ├── requirements_enhanced.txt     # Complete dependencies
-├── setup_mirai.py               # Comprehensive setup script
+├── setup_Movies and TV shows Recommendation Engine.py               # Comprehensive setup script
 ├── quick_start.py               # Quick start script
 ├── final_setup.py               # Final setup script
-├── start_mirai.bat              # Windows startup script
-├── start_mirai.sh               # Unix startup script
+├── start_Movies and TV shows Recommendation Engine.bat              # Windows startup script
+├── start_Movies and TV shows Recommendation Engine.sh               # Unix startup script
 ├── .env                         # Environment configuration
 └── README.md                    # Complete documentation
 ```

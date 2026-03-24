@@ -1,38 +1,45 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# MIRAI — Python dependencies
+# Architecture: FastAPI + async SQLAlchemy + pgvector + sentence-transformers
+#               + Gemini 1.5 Flash + LangChain + cachetools TTLCache
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Web framework ─────────────────────────────────────────────────────────────
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
+
+# ── Pydantic + settings ───────────────────────────────────────────────────────
 pydantic>=2.0
-sqlalchemy==2.0.28
-python-dotenv==1.0.1
-requests==2.31.0
-numpy==1.26.4
-pandas==2.1.4
-scikit-learn==1.4.1.post1
+pydantic-settings>=2.0
+
+# ── Database — async SQLAlchemy + asyncpg + pgvector ─────────────────────────
+sqlalchemy[asyncio]==2.0.28
+asyncpg==0.29.0
+pgvector==0.2.5
+
+# ── Async HTTP (TMDB data collector) ─────────────────────────────────────────
+aiohttp==3.9.5
+tenacity==8.2.3
+
+# ── AI — embeddings ───────────────────────────────────────────────────────────
 sentence-transformers==2.2.2
-faiss-cpu==1.13.2
+numpy==1.26.4
+scikit-learn==1.4.1.post1
+
+# ── AI — vector search fallback ───────────────────────────────────────────────
+faiss-cpu==1.7.4
+
+# ── AI — LLM + RAG ───────────────────────────────────────────────────────────
 langchain==0.1.16
 langchain-community==0.0.38
+langchain-google-genai==1.0.3
 google-generativeai>=0.5.0
-deep-translator>=1.11.4
-langdetect>=1.0.9
-streamlit>=1.32.0
-tqdm>=4.66.0
 
-# Security & Rate Limiting
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
-bcrypt==4.0.1
-python-multipart>=0.0.7
-slowapi>=0.1.9
+# ── Language detection ────────────────────────────────────────────────────────
+langdetect==1.0.9
 
-# Optional: Redis caching + Celery task queue (requires Redis server)
-redis>=5.0.0
-celery>=5.3.0
+# ── In-memory cache fallback ──────────────────────────────────────────────────
+cachetools==5.3.3
 
-# Recommendation Engine enhancements
-implicit>=0.7.2          # ALS matrix factorization (collaborative filtering)
-scipy>=1.12.0            # Sparse matrix support required by implicit
-
-# Multilingual sentiment analysis (replaces vaderSentiment)
-# cardiffnlp/twitter-xlm-roberta-base-sentiment supports English, Hindi, Telugu, and 100+ languages
-transformers>=4.38.0     # HuggingFace pipeline + XLM-RoBERTa tokenizer/model
-torch>=2.0.0             # PyTorch backend for transformers inference (CPU-only is fine)
+# ── Environment / config ──────────────────────────────────────────────────────
+python-dotenv==1.0.1

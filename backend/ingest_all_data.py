@@ -14,7 +14,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional
 
 # Ensure we can import from backend/
-sys.path.insert(0, os.path.dirname(__file__))
+# sys.path.insert(0, os.path.dirname(__file__))
+import sys, os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '..', '.env'))
@@ -29,9 +31,9 @@ if not TMDB_API_KEY:
     sys.exit(1)
 
 # ── DB Setup ──────────────────────────────────────────────────────────────────
-from enhanced_database import (
-    engine, SessionLocal, Base, Media, StreamingPlatform,
-    media_platforms, init_enhanced_db
+from backend.enhanced_database import (
+    engine, Base, Media, StreamingPlatform,
+    init_enhanced_db, get_db_session, SessionLocal
 )
 
 def tmdb_get(endpoint: str, params: dict = {}) -> Optional[dict]:
@@ -61,7 +63,7 @@ def get_genre_map(media_type: str) -> Dict[int, str]:
     return {}
 
 
-def discover_ids(media_type: str, pages: int = 250) -> List[int]:
+def discover_ids(media_type: str, pages: int = 500) -> List[int]:
     """
     Discover media IDs from TMDB across multiple pages, languages, and years.
     Returns deduplicated list of TMDB IDs.
@@ -77,7 +79,7 @@ def discover_ids(media_type: str, pages: int = 250) -> List[int]:
 
     # Phase 1: discover by language (popularity sorted)
     for lang in languages:
-        for page in range(1, 21):  # 20 pages per language = ~400 items
+        for page in range(1, 41):  # 40 pages per language = ~800 items
             data = tmdb_get(ep, {
                 "language": "en-US",
                 "with_original_language": lang,
@@ -307,7 +309,6 @@ def main():
     print("=" * 60)
 
     # Init DB schema (safe to run even if tables exist)
-    print("\n[1/5] Initializing database schema...")
     try:
         init_enhanced_db()
     except Exception as e:

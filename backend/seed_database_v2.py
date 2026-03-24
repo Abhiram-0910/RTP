@@ -53,7 +53,6 @@ def seed_database():
     except Exception as e:
         print(f"Error dropping tables: {e}")
         
-    print("Creating new tables...")
     try:
         init_enhanced_db() # Uses Base.metadata.create_all inside
         print("Tables created successfully.")
