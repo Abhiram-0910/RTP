@@ -4,7 +4,7 @@ import { motion } from 'framer-motion';
 import { useAuth } from '../context/AuthContext';
 import toast from 'react-hot-toast';
 import { Loader2, LogIn, UserPlus, Eye, EyeOff } from 'lucide-react';
-import Movies and TV shows Recommendation EngineLogo from '../components/Movies and TV shows Recommendation EngineLogo';
+import MiraiLogo from '../components/MiraiLogo';
 
 const TABS = { LOGIN: 'login', REGISTER: 'register' };
 
@@ -80,8 +80,8 @@ const Login = () => {
         {/* Logo */}
         <div className="text-center mb-10">
           <div className="inline-flex flex-col items-center gap-3">
-            <Movies and TV shows Recommendation EngineLogo size={56} animate />
-            <h1 className="text-3xl font-display font-bold text-gradient tracking-tight">Movies and TV shows Recommendation Engine</h1>
+            <MiraiLogo size={56} animate />
+            <h1 className="text-3xl font-display font-bold text-gradient tracking-tight">MIRAI</h1>
             <p className="text-slate-500 text-sm font-body tracking-wide">Cinematic Intelligence Engine</p>
           </div>
         </div>
@@ -179,7 +179,7 @@ const Login = () => {
           {/* Demo hint */}
           {tab === TABS.LOGIN && (
             <p className="text-center text-[11px] text-slate-500 mt-6 font-body">
-              Demo: <span className="text-accent/60 font-mono text-[10px]">admin / Movies and TV shows Recommendation Engine2024</span>
+              Demo: <span className="text-accent/60 font-mono text-[10px]">admin / mirai2024</span>
             </p>
           )}
         </div>

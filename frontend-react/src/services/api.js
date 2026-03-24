@@ -97,8 +97,11 @@ export const getRecommendations = (payload) =>
   publicApi.post('/api/recommend', payload);
 
 // ── Interactions (JWT-protected) ───────────────────────────────────────────────
-export const rateTitle = (tmdbId, interactionType) =>
-  api.post('/api/rate', { tmdb_id: tmdbId, interaction_type: interactionType });
+export const rateTitle = (tmdbId, interactionType, userId) =>
+  api.post('/api/rate', { tmdb_id: tmdbId, interaction_type: interactionType, user_id: userId });
+
+export const manageWatchlist = (tmdbId, action, userId) =>
+  api.post('/api/watchlist', { tmdb_id: tmdbId, action, user_id: userId });
 
 export const getWatchlist = (userId) =>
   api.get('/api/watchlist', { params: { user_id: userId } });

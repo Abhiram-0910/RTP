@@ -1,15 +1,39 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import Movies and TV shows Recommendation EngineLogo from './Movies and TV shows Recommendation EngineLogo';
+import MiraiLogo from './MiraiLogo';
 
-/* ── Tollywood & Indian cinema hero images from TMDB ─────────────────────── */
+/* ── Indian cinema hero backdrops from TMDB ───────────────────────────────── */
 const HEROES = [
-  { url: 'https://image.tmdb.org/t/p/original/gNbdjDi1HamTCrfvM9JeA9aLKLB.jpg', label: 'Baahubali' },
-  { url: 'https://image.tmdb.org/t/p/original/cdJo8rCZYOKfGTCOlLVMiIBvKSS.jpg', label: 'RRR' },
-  { url: 'https://image.tmdb.org/t/p/original/h9DIlghaiTxbQbt1FIwKNbQvEL.jpg', label: 'Pushpa' },
-  { url: 'https://image.tmdb.org/t/p/original/xDMIl84Qo5Tmu6LA0IcAizJsDGT.jpg', label: 'KGF' },
-  { url: 'https://image.tmdb.org/t/p/original/vB8o2p4ETnrfiWEgVxHmHWP9yRl.jpg', label: 'Kalki 2898 AD' },
-  { url: 'https://image.tmdb.org/t/p/original/iEe3jDMqaGD2GP2hbRfNAuQsOEt.jpg', label: 'Salaar' },
+  {
+    url: 'https://image.tmdb.org/t/p/w1280/5mVFSRoxFEQKSc6LxcJq4CMRhOD.jpg',
+    label: 'Baahubali: The Beginning',
+    fallbackBg: '#1a0a00',
+  },
+  {
+    url: 'https://image.tmdb.org/t/p/w1280/nEufeZlyAsvMxKeZl5Vs7WEpRST.jpg',
+    label: 'RRR',
+    fallbackBg: '#0a1a10',
+  },
+  {
+    url: 'https://image.tmdb.org/t/p/w1280/iEe3jDMqaGD2GP2hbRfNAuQsOEt.jpg',
+    label: 'Salaar: Part 1 – Ceasefire',
+    fallbackBg: '#0a0a1a',
+  },
+  {
+    url: 'https://image.tmdb.org/t/p/w1280/xDMIl84Qo5Tmu6LA0IcAizJsDGT.jpg',
+    label: 'KGF: Chapter 2',
+    fallbackBg: '#1a1000',
+  },
+  {
+    url: 'https://image.tmdb.org/t/p/w1280/vB8o2p4ETnrfiWEgVxHmHWP9yRl.jpg',
+    label: 'Kalki 2898 AD',
+    fallbackBg: '#0e0e1a',
+  },
+  {
+    url: 'https://image.tmdb.org/t/p/w1280/h9DIlghaiTxbQbt1FIwKNbQvEL.jpg',
+    label: 'Pushpa: The Rise',
+    fallbackBg: '#1a0800',
+  },
 ];
 
 const TAGLINE_CHARS = 'Your Story. Your Screen.'.split('');
@@ -31,7 +55,7 @@ const CinematicIntro = ({ onComplete }) => {
     timers.push(setTimeout(() => setPhase(3), 11000));
     // Complete
     timers.push(setTimeout(() => {
-      localStorage.setItem('Movies and TV shows Recommendation Engine_intro_seen', 'true');
+      localStorage.setItem('mirai_intro_seen', 'true');
       onComplete?.();
     }, 12200));
     return () => timers.forEach(clearTimeout);
@@ -48,7 +72,7 @@ const CinematicIntro = ({ onComplete }) => {
 
   const handleSkip = useCallback(() => {
     setSkipped(true);
-    localStorage.setItem('Movies and TV shows Recommendation Engine_intro_seen', 'true');
+    localStorage.setItem('mirai_intro_seen', 'true');
     onComplete?.();
   }, [onComplete]);
 
@@ -90,14 +114,14 @@ const CinematicIntro = ({ onComplete }) => {
             exit={{ opacity: 0, scale: 1.1, filter: 'blur(10px)' }}
             transition={{ duration: 0.8, ease: 'easeOut' }}
           >
-            <Movies and TV shows Recommendation EngineLogo size={100} animate />
+            <MiraiLogo size={100} animate />
             <motion.h1
               className="text-4xl sm:text-6xl font-display font-bold text-gradient tracking-tight"
               initial={{ opacity: 0, y: 20 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: 1.2, duration: 0.8 }}
             >
-              Movies and TV shows Recommendation Engine
+              MIRAI
             </motion.h1>
             <motion.p
               className="text-white/30 text-sm font-body tracking-[0.3em] uppercase"
@@ -120,30 +144,38 @@ const CinematicIntro = ({ onComplete }) => {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.6 }}
           >
-            <AnimatePresence mode="wait">
+            <AnimatePresence>
               <motion.div
                 key={currentHero}
-                className="absolute inset-0"
-                initial={{ opacity: 0, scale: 1.1 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-                transition={{ duration: 0.8 }}
+                className="absolute inset-0 bg-black/40"
+                initial={{ opacity: 0, scale: 1.15 }}
+                animate={{ opacity: 1, scale: 1.05 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 1.2, ease: "easeOut" }}
               >
+                {/* Ken Burns slow zoom via CSS */}
+                <style>{`
+                  @keyframes kenBurns { 0% { transform: scale(1); } 100% { transform: scale(1.1); } }
+                  .kb-active { animation: kenBurns 4s ease-out forwards; }
+                `}</style>
                 <img
                   src={HEROES[currentHero].url}
                   alt={HEROES[currentHero].label}
-                  className="w-full h-full object-cover"
-                  style={{ filter: 'brightness(0.5) contrast(1.1) saturate(1.2)' }}
+                  className="w-full h-full object-cover kb-active"
+                  loading="eager"
+                  style={{ 
+                    filter: 'brightness(0.6) contrast(1.1) saturate(1.2)',
+                    backgroundColor: HEROES[currentHero].fallbackBg || '#111' 
+                  }}
+                  onError={(e) => {
+                    console.error("Hero image failed to load:", e.target.src);
+                    e.target.style.backgroundColor = HEROES[currentHero].fallbackBg || '#111';
+                    e.target.style.display = 'none';
+                  }}
                 />
-                {/* Ken Burns slow zoom via CSS */}
-                <style>{`
-                  @keyframes kenBurns { 0% { transform: scale(1); } 100% { transform: scale(1.08); } }
-                  .kb-active { animation: kenBurns 3s ease-out forwards; }
-                `}</style>
-                <div className="absolute inset-0 kb-active" style={{ mixBlendMode: 'normal' }} />
                 {/* Gradient overlays */}
                 <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-black/60" />
-                <div className="absolute inset-0 bg-gradient-to-r from-black/50 via-transparent to-black/50" />
+                <div className="absolute inset-0 bg-gradient-to-r from-black/20 via-transparent to-black/20" />
                 {/* Title */}
                 <motion.div
                   className="absolute bottom-[16vh] left-8 sm:left-16"

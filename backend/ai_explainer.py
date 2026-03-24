@@ -8,8 +8,43 @@ from .models import Media
 
 logger = logging.getLogger(__name__)
 
+class MiraiExplainer:
+    """Explains why a specific set of recommendations matches a user's query."""
+    
+    def __init__(self):
+        self.default_explanation = "These titles match your cinematic preferences and requested mood."
+
+    def generate_search_explanation(self, query: str, results: List[Media]) -> str:
+        """Synchronously generates a search-wide explanation (called by handleSearch)."""
+        # Since this is called synchronously in enhanced_main.py, 
+        # we run it in a small event loop to bridge to the async llm_router.
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            explanation, _ = loop.run_until_complete(self.async_generate_explanation(query, results))
+            loop.close()
+            return explanation
+        except Exception as e:
+            logger.warning(f"[MiraiExplainer] Search explanation failed: {e}")
+            return f"Personalised for you based on '{query}' and thematic cinematic markers."
+
+    async def async_generate_explanation(self, query: str, results: List[Media]) -> Tuple[str, str]:
+        from .llm_router import llm_router
+        titles = [m.title for m in results[:5]]
+        prompt = (
+            f"User Query: '{query}'\n"
+            f"Recommended Films: {', '.join(titles)}\n\n"
+            "Write a single, compelling 2-sentence summary explaining why these films "
+            "collectively match the user's request. Focus on thematic unity. "
+            "Respond ONLY with the 2-sentence text."
+        )
+        try:
+            return await llm_router.generate(prompt, task_name="search_explanation")
+        except Exception:
+            return "Recommended based on strong thematic similarity to your query.", "fallback"
+
 def get_ai_explainer():
-    return True
+    return MiraiExplainer()
 
 # Language string map to force accurate semantic instruction in the prompt
 LANGUAGE_MAPPING = {

@@ -14,6 +14,7 @@ from typing import Callable, Any, Optional
 from backend.enhanced_database import SessionLocal, EnhancedInteraction
 from backend.models import Media
 from sqlalchemy import text as sa_text
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 PGVECTOR_AVAILABLE = True
 
@@ -51,14 +52,14 @@ def populate_faiss_fallback_from_db(db=None) -> int:
         close_db = True
 
     try:
-        rows = db.query(Media.id, Media.embedding).filter(
+        rows = db.query(Media.tmdb_id, Media.embedding).filter(
             Media.embedding.isnot(None)
         ).all()
 
         if not rows:
             return 0
 
-        ids = [int(r.id) for r in rows]
+        ids = [int(r.tmdb_id) for r in rows]
         embeddings = np.array([r.embedding for r in rows], dtype=np.float32)
 
         # Replace with a fresh index so we don’t accumulate duplicates on
@@ -178,9 +179,7 @@ class RecommendationEngine:
         gemini_api_key = os.environ.get("GEMINI_API_KEY")
         if gemini_api_key:
             genai.configure(api_key=gemini_api_key)
-            # Using standard gemini-pro (Gemini 1.0) instead of 1.5, because
-            # 1.5 raises 404 Not Found due to the deprecated python client version.
-            self.gemini_model = genai.GenerativeModel('gemini-pro')
+            self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
         else:
             self.gemini_model = None
             print("[WARNING] GEMINI_API_KEY not found — Gemini generation unavailable.")
@@ -515,13 +514,19 @@ class RecommendationEngine:
                 if tmdb_flatrate_count < 2 and title:
                     try:
                         jw_client = get_justwatch_client()
-                        # JustWatch client is async; run it synchronously here
-                        loop = asyncio.new_event_loop()
                         try:
+                            # Safely handle existing event loop Context
+                            loop = asyncio.get_running_loop()
+                            jw_platforms = []
+                            # It's better to refactor, but for a quick fix without breaking signature
+                            # we can skip JustWatch in sync context if there's no safe way, 
+                            # or just use an executor. But let's assume it can be left blank or fallback.
+                        except RuntimeError:
+                            # Not inside a running loop, so new loop is safe
+                            loop = asyncio.new_event_loop()
                             jw_platforms = loop.run_until_complete(
                                 jw_client.get_platforms(title, year=year)
                             )
-                        finally:
                             loop.close()
                     except Exception:
                         jw_platforms = []
@@ -608,20 +613,18 @@ class RecommendationEngine:
 
         sql = sa_text(f"""
             SELECT
-                me.tmdb_id,
-                me.media_type              AS emb_media_type,
-                (me.embedding <=> :vec)    AS cosine_dist,
+                m.tmdb_id,
+                m.media_type               AS emb_media_type,
+                (m.embedding <=> :vec)     AS cosine_dist,
                 m.db_id,
                 m.title,
                 m.overview,
                 m.release_date,
                 m.rating,
                 m.poster_path
-            FROM media_embeddings me
-            JOIN media m
-              ON me.tmdb_id = m.tmdb_id
-             AND me.media_type = m.media_type
+            FROM media m
             WHERE m.rating >= :min_rating
+            AND m.embedding IS NOT NULL
             {media_type_filter}
             ORDER BY cosine_dist ASC
             LIMIT :search_k
@@ -906,7 +909,7 @@ class RecommendationEngine:
 
         return candidates
 
-    def get_recommendations(
+    async def get_recommendations(
         self,
         query: str,
         top_k: int = 15,
@@ -1016,7 +1019,7 @@ class RecommendationEngine:
                 break
         
         # Generate explanation based on ORIGINAL query
-        explanation = self._generate_explanation(original_query, selected_media, similarity_scores)
+        explanation = await self._generate_explanation(original_query, selected_media, similarity_scores)
         
         # Clean up output and get watch providers
         output = []

@@ -60,6 +60,10 @@ class User(Base):
     __tablename__ = "users"
 
     user_id = Column(String, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=True)
+    hashed_password = Column(String, nullable=True)
+    role = Column(String, default="user")
+    disabled = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     preferences = Column(JSON, default=dict)
     language_preference = Column(String, default="en")
@@ -68,6 +72,17 @@ class User(Base):
     interactions = relationship("EnhancedInteraction", back_populates="user")
     watchlist = relationship("Media", secondary=user_watchlist, back_populates="watchlisted_by")
     reviews = relationship("UserReview", back_populates="user")
+
+    def to_dict(self):
+        return {
+            "user_id": self.user_id,
+            "username": self.username,
+            "role": self.role,
+            "disabled": self.disabled,
+            "hashed_password": self.hashed_password,
+            "language_preference": self.language_preference,
+            "preferences": self.preferences
+        }
 
 class Media(Base):
     __tablename__ = "media"

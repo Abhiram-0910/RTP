@@ -8,7 +8,8 @@ import {
   SlidersHorizontal, ChevronDown, ChevronUp, Loader2,
   Tv, Film, Globe, Layers, Sparkles, AlertCircle, X,
 } from 'lucide-react';
-import { getRecommendations, rateTitle } from '../services/api';
+import { getRecommendations, rateTitle, manageWatchlist } from '../services/api';
+import { useAuth } from '../context/AuthContext';
 import { useAppContext } from '../context/AppContext';
 
 // ── Filter options ─────────────────────────────────────────────────────────────
@@ -65,7 +66,7 @@ const MovieCard = ({ movie, ratingState = {}, pending, onRate, index }) => {
     if (isExplanationReady) return;
     const pollInterval = setInterval(async () => {
       try {
-        const res = await fetch(`http://localhost:8005/api/explanation/${movie.id}?lang=${languagePref}`);
+        const res = await fetch(`/api/explanation/${movie.id}?lang=${languagePref}`);
         if (!res.ok) return;
         const data = await res.json();
         if (data.ready) {
@@ -266,7 +267,8 @@ const MovieCard = ({ movie, ratingState = {}, pending, onRate, index }) => {
 
 // ── Home Page ──────────────────────────────────────────────────────────────────
 const Home = () => {
-  const [userId] = useState(() => localStorage.getItem('Movies and TV shows Recommendation Engine_user_id') || `user_${Date.now()}`);
+  const { user } = useAuth();
+  const [userId] = useState(() => user?.username || localStorage.getItem('mirai_user_id') || `user_${Date.now()}`);
   const [query, setQuery]         = useState('');
   const [loading, setLoading]     = useState(false);
   const [results, setResults]     = useState([]);
@@ -295,7 +297,7 @@ const Home = () => {
 
   const fetchMetrics = async () => {
     try {
-      const res = await fetch('http://localhost:8005/api/metrics');
+      const res = await fetch('/api/metrics');
       if (res.ok) setMetrics(await res.json());
     } catch (err) {
       console.error('Failed to fetch metrics', err);
@@ -322,9 +324,36 @@ const Home = () => {
         media_type: mediaType,
         min_rating: minRating,
         genre: genre || null,
-        language_pref: language,
+        language_filter: language,   // FIX Issue 2: must match UserQuery field name
       });
-      setResults(data.movies || data.results || []);
+      const normalized = (data.movies || data.results || []).map(item => {
+        // Support both flat format and nested {media, explanation, similarity_factors} format
+        if (item.media) {
+          return {
+            id: item.media.tmdb_id || item.media.id,
+            title: item.media.title,
+            overview: item.media.overview || '',
+            release_date: item.media.release_year ? `${item.media.release_year}-01-01` : '',
+            rating: item.media.vote_average || 0,
+            poster_path: item.media.poster_path || '',
+            media_type: item.media.media_type || 'movie',
+            genres: item.media.genres || [],
+            match_score: Math.round((item.similarity_factors?.mood || 0.5) * 100),
+            explanation: item.explanation || '',
+            explanation_provider: item.explanation_provider || 'gemini',
+            similarity_factors: item.similarity_factors || {},
+            providers: Object.entries(item.media.platforms || {}).flatMap(
+              ([region, names]) => names.map(name => ({ provider: name, type: 'flatrate', region }))
+            ),
+          };
+        }
+        // Already flat format — pass through
+        return {
+          ...item,
+          match_score: item.match_score ?? Math.round((item.similarity_factors?.mood || 0.5) * 100),
+        };
+      });
+      setResults(normalized);
       setExpl(data.explanation || '');
       if (!data.movies?.length) toast('No matches. Try a different search!', { icon: '🤔' });
     } catch (err) {
@@ -343,7 +372,7 @@ const Home = () => {
     setDeepSources([]);
     try {
       const candidateIds = results.slice(0, 8).map(r => r.id);
-      const res = await fetch('http://localhost:8005/api/deep-analyze', {
+      const res = await fetch('/api/deep-analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, candidate_tmdb_ids: candidateIds })
@@ -366,7 +395,12 @@ const Home = () => {
     setRatingState((s) => ({ ...s, [tmdbId]: next }));
     setPending((s) => new Set(s).add(tmdbId));
     try {
-      await rateTitle(tmdbId, next || 'remove');
+      if (type === 'watchlist') {
+        const action = next === 'watchlist' ? 'add' : 'remove';
+        await manageWatchlist(tmdbId, action, userId);
+      } else {
+        await rateTitle(tmdbId, next || 'remove', userId);
+      }
       toast.success(
         next === RATING_LIKE ? `Loved "${title}"` :
         next === RATING_DISLIKE ? `Passed on "${title}"` :
@@ -601,7 +635,7 @@ const Home = () => {
           {isAnalyzing && (
             <div className="flex items-center gap-3 text-accent/80 text-sm py-2 font-body">
               <div className="w-4 h-4 rounded-full border-2 border-accent/20 border-t-accent animate-spin" />
-              Movies and TV shows Recommendation Engine is analyzing your results via LangChain...
+              Mirai is analyzing your results via LangChain...
             </div>
           )}
           {deepAnalysis && (

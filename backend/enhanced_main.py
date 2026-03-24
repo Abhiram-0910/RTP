@@ -2,7 +2,7 @@ import sys
 import os
 # Ensure local project root is at the very beginning of the module search path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-print(f"DEBUG: LOADING Movies and TV shows Recommendation Engine BACKEND FROM {__file__}")
+print(f"DEBUG: LOADING MIRAI BACKEND FROM {__file__}")
 
 import logging
 import time
@@ -11,6 +11,7 @@ import asyncio
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import numpy as np
+import threading
 
 from fastapi import FastAPI, Request, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -181,10 +182,13 @@ def initialize_services():
 
     # 5. Recommendation engine — pass the real embeddings model
     rec_engine = AdvancedRecommendationEngine(embeddings_model=embeddings)
-    print("[OK] Advanced recommendation engine initialized.")
+    # Pre-load the sentiment pipeline to avoid delay on first request
+    threading.Thread(target=lambda: rec_engine._calculate_sentiment_score(""), daemon=True).start()
+    print("[OK] Advanced recommendation engine initialized (sentiment loading in background).")
 
 
-initialize_services()
+# Initialize in background to not block Uvicorn startup
+threading.Thread(target=initialize_services, daemon=True).start()
 
 
 # ── Pydantic request/response models ─────────────────────────────────────────
@@ -202,6 +206,8 @@ class UserQuery(BaseModel):
     diversity_level: Optional[float] = 0.7
     include_trending: Optional[bool] = True
     language_preference: Optional[str] = "en"
+    # NEW: Filter recommendations by original_language of the media (e.g. 'te', 'hi', 'en')
+    language_filter: Optional[str] = "all"
 
 
 class InteractionRequest(BaseModel):
@@ -243,7 +249,21 @@ class DeepAnalyzeRequest(BaseModel):
 async def startup_event():
     init_enhanced_db()
     
-    # Initialize Movies and TV shows Recommendation EngineLangChainRAG with current DB records
+    # Ensure demo user exists
+    try:
+        from backend.enhanced_database import SessionLocal, User
+        from backend.auth import hash_password
+        db = SessionLocal()
+        admin_user = db.query(User).filter(User.username == "admin").first()
+        if not admin_user:
+            demo = User(user_id="admin", username="admin", hashed_password=hash_password("mirai2024"), role="admin", disabled=False)
+            db.add(demo)
+            db.commit()
+        db.close()
+    except Exception as e:
+        print(f"Error creating admin: {e}")
+    
+    # Initialize MiraiLangChainRAG with current DB records
     try:
         from backend.rag_chain import rag_chain_instance
         from backend.enhanced_database import SessionLocal, Media
@@ -260,10 +280,19 @@ async def startup_event():
                 "rating": float(m.rating or 0.0)
             })
         db.close()
-        rag_chain_instance.initialize(media_records)
-        print(f"[STARTING] Movies and TV shows Recommendation EngineLangChainRAG initialized with {len(media_records)} items.")
+        # Initialize MiraiLangChainRAG in a background thread
+        import threading
+        def _bg_rag_init():
+            try:
+                rag_chain_instance.initialize(media_records)
+                print(f"[STARTING] MiraiLangChainRAG initialized with {len(media_records)} items.")
+            except Exception as ex:
+                print(f"[ERROR] RAG init thread failed: {ex}")
+        
+        threading.Thread(target=_bg_rag_init, daemon=True).start()
+        print("[STARTING] RAG initialization started in background thread.")
     except Exception as e:
-        print(f"[ERROR] Failed to initialize Movies and TV shows Recommendation EngineLangChainRAG: {e}")
+        print(f"[ERROR] Failed to setup RAG initialization task: {e}")
 
     print("[STARTING] Movie and TV Shows Recommending Engine Backend Started!")
     # Try to refresh trending data in background (silent fail if Redis/Celery absent)
@@ -437,7 +466,7 @@ def _create_cache_key(request: UserQuery) -> str:
 
 
 def _passes_advanced_filters(media: Media, request: UserQuery) -> bool:
-    """Applies genre, year, platform, and runtime filters."""
+    """Applies genre, year, platform, language, and runtime filters."""
     if request.genre and request.genre.lower() not in [g.lower() for g in (media.genres or [])]:
         return False
     if request.min_rating and (media.rating or 0) < request.min_rating:
@@ -445,15 +474,23 @@ def _passes_advanced_filters(media: Media, request: UserQuery) -> bool:
     if request.media_type != "All" and media.media_type != request.media_type.lower():
         return False
     if request.year_range and media.release_date:
-        release_year = int(media.release_date.split('-')[0])
-        if not (request.year_range[0] <= release_year <= request.year_range[1]):
-            return False
+        try:
+            release_year = int(media.release_date.split('-')[0])
+            if not (request.year_range[0] <= release_year <= request.year_range[1]):
+                return False
+        except (ValueError, IndexError):
+            pass
     if request.platforms:
         media_platform_names = {p.name.lower() for p in media.platforms}
         if not any(p.lower() in media_platform_names for p in request.platforms):
             return False
     if request.max_runtime and media.runtime and media.runtime > request.max_runtime:
         return False
+    # FIX Issue 2: Language content filter
+    if request.language_filter and request.language_filter.lower() not in ("all", "", "none"):
+        media_lang = (media.original_language or "en").lower()
+        if media_lang != request.language_filter.lower():
+            return False
     return True
 
 
@@ -603,6 +640,46 @@ def compute_similarity_factors(media: Media, query: str, score: float) -> dict[s
         "rating": round(rating_score, 2)
     }
 
+# ── LLM Query Enhancer (Issues 3, 4, 5) ─────────────────────────────────────
+
+async def enhance_query(raw_query: str) -> str:
+    """
+    Uses the LLM router to:
+    1. Translate Tenglish/Hinglish to English (e.g. 'manchi cinemalu' -> 'good movies')
+    2. Detect and expand mood keywords (e.g. 'feel-good' -> 'uplifting heartwarming positive family')
+    3. Return a dense, English keyword string optimized for vector embedding search.
+    Falls back to the raw query if LLM is unavailable.
+    """
+    from backend.llm_router import llm_router
+    prompt = (
+        f"You are a search query optimizer for a movie/TV recommendation engine.\n"
+        f"User typed: '{raw_query}'\n\n"
+        "Your job:\n"
+        "1. If the input contains transliterated regional language (Tenglish/Hinglish like 'manchi action cinemalu', "
+        "'acche feel-good movies chahiye', 'paisa vasool entertainment'), translate each word to English.\n"
+        "2. Identify the mood/vibe (e.g. 'dark', 'feel-good', 'mind-bending', 'emotional').\n"
+        "3. Expand abstract concepts into concrete English film keywords, genres, themes, and descriptors.\n\n"
+        "Return ONLY a comma-separated list of precise English keywords/phrases that capture the user's exact intent. "
+        "No explanations. No conversational text. Just the optimized keywords."
+    )
+    try:
+        enhanced_text, _ = await llm_router.generate(
+            prompt=prompt,
+            max_tokens=80,
+            temperature=0.1,
+            task_name="query_enhancement",
+        )
+        result = enhanced_text.strip()
+        if result:
+            logging.getLogger(__name__).info(
+                "[QueryEnhancer] '%s' -> '%s'", raw_query, result
+            )
+            return result
+    except Exception as e:
+        logging.getLogger(__name__).warning("[QueryEnhancer] Failed (%s), using raw query.", e)
+    return raw_query
+
+
 # ── Core Recommendation Endpoint ──────────────────────────────────────────────
 
 @app.post("/api/recommend")
@@ -612,7 +689,7 @@ async def get_enhanced_recommendations(
     http_request: Request,
     db: Session = Depends(get_db),
 ):
-    """Get hybrid AI-powered recommendations with multilingual support."""
+    """Get hybrid AI-powered recommendations with multilingual + Tenglish + mood support."""
     start_time = time.perf_counter()
     cache_hit_val = False
     
@@ -670,9 +747,18 @@ async def get_enhanced_recommendations(
             )
             return {**response_data, "cached": True}
 
-        # ── Step 1: Language detection & translation ──────────────────────────
+        # ── Step 0: LLM Query Enhancement (Issues 3, 4, 5) ───────────────────
+        # Translate Tenglish/Hinglish and expand mood keywords BEFORE embedding.
+        # e.g. "manchi action cinemalu feel-good" ->
+        #       "good action movies, feel-good, uplifting, heroic, Telugu cinema"
         original_query = user_query.query
-        translated_query = original_query
+        try:
+            enhanced_query = await enhance_query(original_query)
+        except Exception:
+            enhanced_query = original_query
+
+        # ── Step 1: Language detection & translation ──────────────────────────
+        translated_query = enhanced_query
         detected_lang = "en"
 
         if translator:
@@ -681,7 +767,7 @@ async def get_enhanced_recommendations(
                 from deep_translator import GoogleTranslator
                 detected_lang = _detect(original_query) or "en"
                 if detected_lang != "en":
-                    translated_query = GoogleTranslator(source="auto", target="en").translate(original_query) or original_query
+                    translated_query = GoogleTranslator(source="auto", target="en").translate(enhanced_query) or enhanced_query
                     print(f"[TRANSLATE] '{original_query}' ({detected_lang}) -> '{translated_query}'")
             except Exception as e:
                 print(f"[WARNING] Translation error: {e}")
@@ -698,11 +784,24 @@ async def get_enhanced_recommendations(
                 print(f"[WARNING] Embedding error: {e}")
 
         # ── Step 3: Vector search (using LangChain RAG store) ────────────────
+        # Use a MASSIVE neighbourhood when a language filter is active because 
+        # FAISS is mostly English documents. We need to fetch enough candidates
+        # so that at least 20 survive the post-filter.
+        is_lang_filter = bool(user_query.language_filter and user_query.language_filter.lower() not in ("all", "", "none"))
+        _active_filters = bool(user_query.genre or user_query.platforms)
+        
+        if is_lang_filter:
+            _search_k = 1200
+        elif _active_filters:
+            _search_k = 150
+        else:
+            _search_k = 60
+            
         from backend.rag_chain import rag_chain_instance
         docs_with_scores = []
         if rag_chain_instance.vector_store:
             docs_with_scores = rag_chain_instance.vector_store.similarity_search_with_score(
-                translated_query, k=60
+                translated_query, k=_search_k
             )
         else:
             # Fallback to local FAISS global variable if rag_chain not ready
@@ -989,9 +1088,11 @@ async def deep_analyze(
     db: Session = Depends(get_db)
 ):
     """
-    Visible LangChain RAG Orchestration endpoint.
-    Triggers a RetrievalQA chain using Gemini 1.5 Flash.
+    Deep AI Analysis — explains WHY the recommended films match the user's
+    exact mood, intent, and cinematic taste using Gemini as a film critic.
     """
+    from backend.llm_router import llm_router
+    from sqlalchemy import text
     try:
         if not request.candidate_tmdb_ids:
             return {
@@ -999,17 +1100,80 @@ async def deep_analyze(
                 "sources_used": []
             }
 
-        # Validate that the requested models actually exist in DB 
-        media_records = db.query(Media).filter(Media.tmdb_id.in_(request.candidate_tmdb_ids)).all()
-        titles = [m.title for m in media_records if m.title]
+        # Step 1: Fetch rich metadata for each candidate film using raw SQL to avoid ORM collisions
+        limit_ids = request.candidate_tmdb_ids[:8]
+        if not limit_ids:
+            return {"analysis": "No valid titles.", "sources_used": []}
+            
+        placeholders = ", ".join(str(tid) for tid in limit_ids)
+        sql = text(f"SELECT title, overview, genres, director, release_date FROM media WHERE tmdb_id IN ({placeholders})")
+        result_rows = db.execute(sql).fetchall()
 
-        # Call the chain. It does its own semantic retrieval based on the query.
-        result = await rag_chain_instance.deep_analyze(request.query, candidate_titles=titles)
-        return result
+        if not result_rows:
+            return {
+                "analysis": "Could not retrieve movie details for analysis.",
+                "sources_used": []
+            }
+
+        # Step 2: Build a rich context block for the LLM
+        context_blocks = []
+        film_titles = []
+        for row in result_rows:
+            title = row.title or "Unknown"
+            film_titles.append(title)
+            genres_str = ", ".join(row.genres or []) if getattr(row, 'genres', None) else "Unknown"
+            director_str = row.director if getattr(row, 'director', None) else "Unknown Director"
+            overview_str = (row.overview or "")[:300]
+            rel_date = str(row.release_date)[:4] if getattr(row, 'release_date', None) else "?"
+            
+            context_blocks.append(
+                f"• **{title}** ({rel_date}) "
+                f"| Genre: {genres_str} | Director: {director_str}\n"
+                f"  Plot: {overview_str}"
+            )
+
+        context_text = "\n\n".join(context_blocks)
+
+        # Step 3: Craft the cinematic psychologist prompt
+        prompt = (
+            f"You are an expert film critic and cultural psychologist specializing in cinema.\n\n"
+            f"A user searched for: **\"{request.query}\"**\n\n"
+            f"The recommendation engine suggested these films:\n\n{context_text}\n\n"
+            "---\n"
+            "TASK: Write a deep, insightful 2-3 paragraph analysis that:\n"
+            "1. Identifies EXACTLY what emotion, theme, or narrative style the user is craving based on their search.\n"
+            "2. Explains WHY each of these specific films satisfies that craving — connect their plots, moods, and "
+            "directorial styles to the user's intent. Be specific about scenes, themes, or atmospheres.\n"
+            "3. Highlights what makes these films a cohesive set that matches this particular taste profile.\n\n"
+            "Do NOT just list the movies. Write as a film critic explaining your curatorial choices. "
+            "Use markdown formatting with **bold** for film titles."
+        )
+
+        # Step 4: Generate the analysis
+        analysis_text, provider = await llm_router.generate(
+            prompt=prompt,
+            max_tokens=700,
+            temperature=0.65,
+            task_name="deep_analysis",
+        )
+
+        return {
+            "analysis": analysis_text.strip(),
+            "sources_used": film_titles,
+            "provider": provider,
+        }
 
     except Exception as e:
         print(f"[ERROR] Deep-analyze crash: {e}")
-        raise HTTPException(status_code=500, detail="Failed to run LangChain deep analysis.")
+        return {
+            "analysis": (
+                f"Based on your search for **\"{request.query}\"**, our engine recommended several matching films. "
+                "These films share thematic and emotional resonance with your query. "
+                "(Full AI analysis temporarily unavailable — please try again.)"
+            ),
+            "sources_used": [],
+        }
+
 
 
 # ── AI Explanation Polling Endpoint ───────────────────────────────────────────
@@ -1213,9 +1377,11 @@ class WatchlistAddRequest(BaseModel):
     action: str = "add"  # "add" | "remove"
 
 
+@app.post("/api/watchlist")
 async def manage_watchlist(
     request: WatchlistAddRequest,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """Add or remove a title from the user's watchlist."""
     try:
@@ -1248,12 +1414,14 @@ async def manage_watchlist(
         raise HTTPException(status_code=500, detail=f"Watchlist error: {str(e)}")
 
 
+@app.get("/api/watchlist")
 async def get_watchlist(
-    user_id: str,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """Return all watchlisted titles for a user."""
     try:
+        user_id = current_user["username"]
         from backend.enhanced_database import user_watchlist as wt, SessionLocal as SL
         from sqlalchemy import select, text
 
@@ -1476,220 +1644,7 @@ async def get_search_analytics(db: Session = Depends(get_db)):
         return {"recent_searches": []}
 
 
-# ── Private Helpers ───────────────────────────────────────────────────────────
-
-def _create_cache_key(request: UserQuery) -> str:
-    key = f"{request.query}|{request.user_id}|{request.genre}|{request.min_rating}|{request.media_type}|{request.diversity_level}"
-    return hashlib.md5(key.encode()).hexdigest()
-
-
-def _cache_results(cache_key: str, results: Dict):
-    """Background task: cache recommendation results."""
-    db = get_db_session()
-    try:
-        existing = db.query(RecommendationCache).filter(
-            RecommendationCache.cache_key == cache_key
-        ).first()
-        if not existing:
-            cache_entry = RecommendationCache(
-                cache_key=cache_key,
-                results=results,
-                expires_at=datetime.now() + timedelta(hours=6),
-            )
-            db.add(cache_entry)
-            db.commit()
-    except Exception as e:
-        db.rollback()
-    finally:
-        db.close()
-
-
-def _log_analytics(request: UserQuery, results_count: int, detected_lang: str):
-    """Background task: log search analytics."""
-    db = get_db_session()
-    try:
-        analytics = SearchAnalytics(
-            query=request.query,
-            query_language=detected_lang,
-            user_id=request.user_id if request.user_id != "demo_user" else None,
-            results_count=results_count,
-            filters_used={
-                "genre": request.genre,
-                "min_rating": request.min_rating,
-                "media_type": request.media_type,
-                "diversity_level": request.diversity_level,
-            },
-        )
-        db.add(analytics)
-        db.commit()
-    except Exception:
-        db.rollback()
-    finally:
-        db.close()
-
-
-def _format_poster_url(poster_path: Optional[str]) -> str:
-    """Ensure poster URL is a full TMDB URL."""
-    if not poster_path or str(poster_path) in ("nan", "None", ""):
-        return "https://via.placeholder.com/500x750/1e293b/94a3b8?text=No+Poster"
-    if poster_path.startswith("http"):
-        return poster_path
-    return f"https://image.tmdb.org/t/p/w500{poster_path}"
-
-
-def _fetch_tmdb_providers(tmdb_id: int, media_type: str) -> List[str]:
-    """Real-time TMDB watch/providers lookup (US + IN regions)."""
-    if not TMDB_API_KEY:
-        return []
-    try:
-        ep = "movie" if media_type == "movie" else "tv"
-        url = f"https://api.themoviedb.org/3/{ep}/{tmdb_id}/watch/providers"
-        r = http_requests.get(url, params={"api_key": TMDB_API_KEY}, timeout=4)
-        if r.status_code == 200:
-            results = r.json().get("results", {})
-            platforms = set()
-            for region in ["US", "IN", "GB"]:
-                rd = results.get(region, {})
-                for stype in ["flatrate", "free", "ads"]:
-                    for p in rd.get(stype, []):
-                        platforms.add(p.get("provider_name", "").strip())
-            return [p for p in platforms if p]
-    except Exception:
-        pass
-    return []
-
-
-def _passes_advanced_filters(media: Media, request: UserQuery) -> bool:
-    """Check if a media record passes all user-specified filters."""
-    try:
-        # Media type filter
-        if request.media_type and request.media_type != "All":
-            req_mt = request.media_type.strip()
-            # Normalize to DB values: "Movies" -> "movie", "TV Shows" -> "tv"
-            if req_mt.lower() in ("movies", "movie"):
-                target_type = "movie"
-            elif req_mt.lower() in ("tv shows", "tv", "tv show"):
-                target_type = "tv"
-            else:
-                target_type = req_mt.lower()
-            if media.media_type != target_type:
-                return False
-
-        # Rating filter
-        min_rating = min(request.min_rating or 0.0, 9.5)
-        if media.rating is not None and media.rating < min_rating:
-            return False
-
-        # Year range filter
-        if request.year_range and len(request.year_range) == 2 and media.release_date:
-            try:
-                year = int(str(media.release_date)[:4])
-                if year < request.year_range[0] or year > request.year_range[1]:
-                    return False
-            except (ValueError, TypeError):
-                pass
-
-        # Max runtime filter
-        if request.max_runtime and media.runtime:
-            if media.runtime > request.max_runtime:
-                return False
-
-        # Genre filter (enabled — ANY overlap passes)
-        if request.genre:
-            media_genres = media.genres or []
-            if isinstance(media_genres, str):
-                try:
-                    media_genres = json.loads(media_genres)
-                except Exception:
-                    media_genres = []
-            req_genres = [request.genre] if isinstance(request.genre, str) else request.genre
-            # Normalize comparison
-            media_genres_lower = [g.lower() for g in media_genres]
-            req_genres_lower = [g.lower() for g in req_genres]
-            if req_genres_lower and not any(g in media_genres_lower for g in req_genres_lower):
-                return False
-
-        # Platform filter (enabled — ANY overlap passes)
-        if request.platforms and len(request.platforms) > 0:
-            media_platform_names = [p.name.lower() for p in media.platforms]
-            req_platforms_lower = [p.lower() for p in request.platforms]
-            if not any(p in media_platform_names for p in req_platforms_lower):
-                return False
-
-        # ── Language preference filter ──────────────────────────────────────
-        # Mapping from frontend language_preference values to TMDB ISO 639-1 codes.
-        # "en" is treated as "show everything" so users can discover mixed results.
-        _LANG_TO_CODE: dict[str, str] = {
-            "hi": "hi",   # Hindi / Bollywood
-            "te": "te",   # Telugu / Tollywood
-            "ta": "ta",   # Tamil / Kollywood
-        }
-        lang_pref = (request.language_preference or "en").lower().strip()
-        target_lang_code = _LANG_TO_CODE.get(lang_pref)
-
-        if target_lang_code:
-            # Primary check: use media_language column populated by the regional sweep.
-            media_lang = getattr(media, "media_language", None)
-            if media_lang:
-                if media_lang.lower() != target_lang_code:
-                    return False
-            else:
-                # Fallback for older rows that pre-date the media_language column:
-                # reject the item unless its original_language metadata (stored in
-                # the JSON platforms field or inferred by caller) matches.
-                # Since we cannot check reliably, we allow it through with a soft pass
-                # (avoids breaking the experience for pre-migration data).
-                pass
-
-        return True
-    except Exception as e:
-        print(f"[WARNING] Filter error: {e}")
-        return True  # Fail open
-
-
-def _fallback_database_search(query: str, db: Session, limit: int = 50) -> List:
-    """Text-based fallback search when FAISS is unavailable."""
-    try:
-        results = (
-            db.query(Media)
-            .filter(
-                or_(
-                    Media.title.ilike(f"%{query}%"),
-                    Media.overview.ilike(f"%{query}%"),
-                )
-            )
-            .limit(limit)
-            .all()
-        )
-        formatted = []
-        for m in results:
-            doc = type("Doc", (), {
-                "metadata": {"tmdb_id": m.tmdb_id, "id": m.tmdb_id, "media_type": m.media_type}
-            })()
-            formatted.append((doc, 5.0))  # L2 distance of 5 = moderate similarity
-        return formatted
-    except Exception as e:
-        print(f"[ERROR] Fallback search: {e}")
-        return []
-
-
-def _calculate_diversity_score(items: List[Dict]) -> float:
-    if len(items) <= 1:
-        return 0.0
-    all_genres = []
-    for item in items:
-        all_genres.extend(item.get("genres", []))
-    if not all_genres:
-        return 0.0
-    return round(len(set(all_genres)) / len(all_genres), 2)
-
-
-def _fallback_explanation(query: str, results: List[Dict]) -> str:
-    titles = [r["title"] for r in results[:3]]
-    return (
-        f"Based on your search for '{query}', here are titles that best match your interests. "
-        f"Featured: {', '.join(titles)}."
-    )
+# Helper functions have been deduplicated to the top of the file
 
 # ── Bonus Verification Endpoints ──────────────────────────────────────────────
 
@@ -1773,14 +1728,7 @@ async def get_genre_cooccurrence():
 
 
 
-@app.get("/api/metrics")
-async def get_live_metrics(db: Session = Depends(get_db)):
-    """Returns real-time performance and usage metrics."""
-    from backend.metrics_tracker import metrics
-    total_titles = db.query(Media).count()
-    return metrics.get_summary({"total_titles": total_titles, "total_chunks": total_titles * 4})
-
-
+# END OF FILE OR ROUTES
 
 if __name__ == "__main__":
     import uvicorn

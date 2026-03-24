@@ -15,7 +15,7 @@ from backend.config import settings
 logger = logging.getLogger(__name__)
 
 
-class Movies and TV shows Recommendation EngineLangChainRAG:
+class MiraiLangChainRAG:
     """
     Visible LangChain RAG orchestration class using LCEL (LangChain 0.3.x standard).
     Builds a document store and retrieval chain using Gemini 1.5 Flash.
@@ -34,7 +34,7 @@ class Movies and TV shows Recommendation EngineLangChainRAG:
         from a list of media dictionary records.
         """
         if not media_records:
-            logger.warning("[Movies and TV shows Recommendation EngineLangChainRAG] No media records provided for initialization.")
+            logger.warning("[MiraiLangChainRAG] No media records provided for initialization.")
             return
 
         documents = []
@@ -64,7 +64,7 @@ class Movies and TV shows Recommendation EngineLangChainRAG:
                 google_api_key=settings.GEMINI_API_KEY
             )
 
-        logger.info(f"[Movies and TV shows Recommendation EngineLangChainRAG] Building FAISS index with {len(documents)} documents...")
+        logger.info(f"[MiraiLangChainRAG] Building FAISS index with {len(documents)} documents...")
         self.vector_store = FAISS.from_documents(documents, self._embeddings)
         self.retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
 
@@ -93,7 +93,7 @@ Focus on: emotional tone, narrative themes, and why this selection fits the exac
         )
 
         self._is_ready = True
-        logger.info("[Movies and TV shows Recommendation EngineLangChainRAG] Initialization complete.")
+        logger.info("[MiraiLangChainRAG] Initialization complete.")
 
     async def deep_analyze(self, query: str, candidate_titles: List[str] = None) -> Dict[str, Any]:
         """
@@ -134,13 +134,13 @@ Focus on: emotional tone, narrative themes, and why this selection fits the exac
             }
 
         except asyncio.TimeoutError:
-            logger.warning("[Movies and TV shows Recommendation EngineLangChainRAG] Deep analysis timed out.")
+            logger.warning("[MiraiLangChainRAG] Deep analysis timed out.")
             return {
                 "analysis": "Deep analysis timed out. Quick explanation is shown on each card.",
                 "sources_used": []
             }
         except Exception as e:
-            logger.error("[Movies and TV shows Recommendation EngineLangChainRAG] Deep analysis failed: %s", e)
+            logger.error("[MiraiLangChainRAG] Deep analysis failed: %s", e)
             
             # QA Fallback for API Errors
             import re
@@ -157,4 +157,4 @@ Focus on: emotional tone, narrative themes, and why this selection fits the exac
                 "sources_used": candidate_titles if candidate_titles else []
             }
 # Module-level singleton
-rag_chain_instance = Movies and TV shows Recommendation EngineLangChainRAG()
+rag_chain_instance = MiraiLangChainRAG()

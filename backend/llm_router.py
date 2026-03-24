@@ -18,6 +18,13 @@ import logging
 import google.generativeai as genai
 import aiohttp
 from typing import Optional
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
+_gemini_key = os.environ.get("GEMINI_API_KEY", "")
+if _gemini_key:
+    genai.configure(api_key=_gemini_key)
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +96,13 @@ class LLMRouter:
                 max_output_tokens=max_tokens,
             ),
         )
-        response = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
-                None, lambda: model.generate_content(prompt)
-            ),
-            timeout=10.0,
-        )
-        return response.text
+        try:
+            response = await model.generate_content_async(prompt)
+            return response.text
+        except Exception as e:
+            if "429" in str(e) or "quota" in str(e).lower():
+                raise Exception("gemini_rate_limit")
+            raise e
 
     async def _call_ollama(
         self,

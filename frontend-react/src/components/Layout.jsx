@@ -3,7 +3,7 @@ import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth } from '../context/AuthContext';
 import { Bookmark, LogOut, User, Menu, X, Compass, Sparkles } from 'lucide-react';
-import Movies and TV shows Recommendation EngineLogo from './Movies and TV shows Recommendation EngineLogo';
+import MiraiLogo from './MiraiLogo';
 
 const Layout = () => {
   const { user, logout } = useAuth();
@@ -44,9 +44,9 @@ const Layout = () => {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           {/* Brand */}
           <NavLink to="/" className="flex items-center gap-3 group">
-            <Movies and TV shows Recommendation EngineLogo size={32} className="group-hover:drop-shadow-[0_0_8px_rgba(245,158,11,0.4)] transition-all duration-300" />
+            <MiraiLogo size={32} className="group-hover:drop-shadow-[0_0_8px_rgba(245,158,11,0.4)] transition-all duration-300" />
             <div className="flex flex-col">
-              <span className="font-display font-bold text-lg text-white tracking-tight leading-none">Movies and TV shows Recommendation Engine</span>
+              <span className="font-display font-bold text-lg text-white tracking-tight leading-none">MIRAI</span>
               <span className="text-[9px] text-accent/60 tracking-[0.25em] uppercase font-body leading-none mt-0.5">Intelligence</span>
             </div>
           </NavLink>
@@ -129,8 +129,8 @@ const Layout = () => {
       <footer className="border-t border-white/5 py-6 mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-3">
           <div className="flex items-center gap-2">
-            <Movies and TV shows Recommendation EngineLogo size={18} />
-            <span className="text-xs text-slate-500 font-body">Movies and TV shows Recommendation Engine Cinematic Intelligence</span>
+            <MiraiLogo size={18} />
+            <span className="text-xs text-slate-500 font-body">MIRAI Cinematic Intelligence</span>
           </div>
           <div className="flex items-center gap-1.5 text-[10px] text-slate-600">
             <Sparkles size={10} className="text-accent/40" />

@@ -12,6 +12,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
+import time
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
@@ -573,38 +574,39 @@ class AdvancedRecommendationEngine:
     #   • N redundant models in N Uvicorn worker processes
 
     ALS_REDIS_KEY = "als_model:v1"
+    _model_cache = None
+    _last_model_check = 0
+    _CHECK_INTERVAL = 60  # Only check Redis once per minute if it fails
 
-    @classmethod
-    def _load_als_from_redis(cls):
+    def _load_als_from_redis(self):
         """
-        Deserialise the ALS model payload from Redis.
-
-        Returns
-        -------
-        dict with keys:
-            user_factors : np.ndarray  (n_users, factors)
-            item_factors : np.ndarray  (n_items, factors)
-            user2idx     : Dict[str, int]
-            item2idx     : Dict[str, int]
-        or ``None`` if the key is absent (model not yet trained) or Redis is
-        offline.
-
-        Thread / process safety
-        -----------------------
-        The payload is fully immutable numpy arrays + plain dicts — safe to
-        read concurrently from multiple Uvicorn workers without locks.
+        Deserialise the ALS model payload from Redis with instance-level caching.
         """
+        now = time.time()
+        # Return cached model if available and fresh
+        if self._model_cache is not None and (now - self._last_model_check) < self._CHECK_INTERVAL:
+            return self._model_cache
+        
+        # If we recently tried and failed, don't keep hammering Redis (prevents hang)
+        if self._model_cache is None and (now - self._last_model_check) < self._CHECK_INTERVAL:
+            return None
+
+        self._last_model_check = now
         try:
             import redis as _redis_lib
             _redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-            rc = _redis_lib.from_url(_redis_url, socket_connect_timeout=2, socket_timeout=2)
-            raw = rc.get(cls.ALS_REDIS_KEY)
+            # Use very short timeouts for the initial connection
+            rc = _redis_lib.from_url(_redis_url, socket_connect_timeout=0.5, socket_timeout=0.5)
+            raw = rc.get(self.ALS_REDIS_KEY)
             if raw is None:
                 return None
-            payload = pickle.loads(raw)  # noqa: S301 – internal data, author-controlled
+            payload = pickle.loads(raw)  # noqa: S301
+            self._model_cache = payload
             return payload
         except Exception as exc:
-            logger.warning("[MF] Could not load ALS factors from Redis: %s", exc)
+            # Silently log once and then wait for CHECK_INTERVAL
+            logger.warning("[MF] Redis unavailable or timeout (will retry in %ds): %s", self._CHECK_INTERVAL, exc)
+            self._model_cache = None
             return None
 
 

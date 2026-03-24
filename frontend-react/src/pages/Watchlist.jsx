@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import toast from 'react-hot-toast';
 import { Star, Film, X, AlertCircle, Loader2, Heart, ThumbsDown, Bookmark, Compass } from 'lucide-react';
 import api from '../services/api';
+import { useAuth } from '../context/AuthContext';
 
 const StatCard = ({ label, value, icon: Icon, color, loading }) => (
   <motion.div
@@ -33,12 +34,14 @@ const Watchlist = () => {
   const [loading, setLoading]   = useState(true);
   const [isError, setError]     = useState(false);
 
+  const { user } = useAuth();
+
   const fetchData = useCallback(async () => {
     setLoading(true);
     setError(false);
     try {
       const [statsRes, listRes] = await Promise.all([
-        api.get('/api/user_stats'),
+        api.get(`/api/user_stats/${user?.username}`),
         api.get('/api/watchlist'),
       ]);
       setStats(statsRes.data);
@@ -56,7 +59,7 @@ const Watchlist = () => {
 
   const removeItem = async (tmdbId, title) => {
     try {
-      await api.post('/api/watchlist', { tmdb_id: tmdbId, action: 'remove' });
+      await api.post('/api/watchlist', { tmdb_id: tmdbId, action: 'remove', user_id: user?.username });
       setWatchlist((prev) => prev.filter((i) => i.id !== tmdbId));
       setStats((prev) => ({ ...prev, watchlist_size: Math.max(0, prev.watchlist_size - 1) }));
       toast.success(`Removed "${title}" from Watchlist`);
