@@ -1,18 +1,75 @@
 import numpy as np
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.embeddings import Embeddings
 from sklearn.metrics.pairwise import cosine_similarity
 import os
 import json
+import asyncio
 import requests
 import google.generativeai as genai
-from typing import Callable, Any
+from typing import Callable, Any, Optional
 
 # Database imports — pgvector search uses SQLAlchemy directly
-from database import SessionLocal, Media, Interaction, MediaEmbedding, PGVECTOR_AVAILABLE
+from backend.enhanced_database import SessionLocal, EnhancedInteraction
+from backend.models import Media
 from sqlalchemy import text as sa_text
 
+PGVECTOR_AVAILABLE = True
+
+# Local helpers
+from backend.platform_normalizer import normalize as _norm_provider, normalize_list as _norm_list
+from backend.justwatch_client import get_justwatch_client
+from backend.faiss_fallback import FAISSFallback
+
+# ── FAISSFallback module-level singleton ───────────────────────────────────────
+# Loaded once at startup (or lazily on first search call) and kept for the
+# lifetime of the process. Thread-safe for reads; population is idempotent.
+_faiss_fallback_index: FAISSFallback | None = None
+
+
+def get_faiss_fallback() -> FAISSFallback:
+    """Return the process-wide FAISSFallback singleton, creating it if needed."""
+    global _faiss_fallback_index
+    if _faiss_fallback_index is None:
+        _faiss_fallback_index = FAISSFallback()
+    return _faiss_fallback_index
+
+
+def populate_faiss_fallback_from_db(db=None) -> int:
+    """
+    Load all (id, embedding) rows from the ``media`` table into the
+    FAISSFallback index.  Safe to call multiple times — if the index
+    already has data it is replaced so the caller always gets a fresh view.
+
+    Returns the number of vectors loaded.
+    """
+    global _faiss_fallback_index
+    close_db = False
+    if db is None:
+        db = SessionLocal()
+        close_db = True
+
+    try:
+        rows = db.query(Media.id, Media.embedding).filter(
+            Media.embedding.isnot(None)
+        ).all()
+
+        if not rows:
+            return 0
+
+        ids = [int(r.id) for r in rows]
+        embeddings = np.array([r.embedding for r in rows], dtype=np.float32)
+
+        # Replace with a fresh index so we don’t accumulate duplicates on
+        # re-population (e.g. after a weekly ingest).
+        idx = FAISSFallback()
+        idx.add_embeddings(embeddings, ids)
+        _faiss_fallback_index = idx
+        return len(ids)
+    finally:
+        if close_db:
+            db.close()
 
 # ── Redis ConnectionPool & Resiliency Wrapper ─────────────────────────────────
 # Connections are borrowed per-call from a robust pool instead of a brittle
@@ -130,25 +187,9 @@ class RecommendationEngine:
 
         # ── Embedding Model Selection ─────────────────────────────────────────
         # Priority: Gemini embedding-001 (768-dim) → HuggingFace fallback (384-dim)
-        if gemini_api_key:
-            try:
-                self.embeddings = GeminiEmbedder(model="models/embedding-001")
-                # Warm-up probe to verify the key is valid
-                _test_vec = self.embeddings.embed_query("test")
-                self.embedding_dim = len(_test_vec)   # 768
-                print(f"[RecommendationEngine] Using Gemini embeddings (dim={self.embedding_dim})")
-            except Exception as e:
-                print(f"[RecommendationEngine] Gemini embeddings failed ({e}) — falling back to HuggingFace.")
-                self.embeddings = HuggingFaceEmbeddings(
-                    model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-                )
-                self.embedding_dim = 384
-        else:
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-            )
-            self.embedding_dim = 384
-            print(f"[RecommendationEngine] Using HuggingFace embeddings (dim={self.embedding_dim})")
+        self._embeddings = None
+        self.embedding_dim = 384
+        self._gemini_api_key = gemini_api_key
 
         # TMDB config
         self.tmdb_api_key = os.environ.get("TMDB_API_KEY")
@@ -304,17 +345,16 @@ class RecommendationEngine:
             logger.warning("[Diversity] Embedding-based diversity calc failed: %s", exc)
             return 0.5
 
-    def _generate_explanation(self, query: str, movies: list, similarities: list) -> str:
+    async def _generate_explanation(self, query: str, movies: list, similarities: list) -> str:
         """
-        Generate a thematic explanation via Gemini.
+        Generate a thematic explanation via the LLM router (Gemini → Ollama fallback).
 
         Title-free design: the prompt deliberately withholds movie/show names.
-        Gemini is forced to reason from genres, moods, time periods, and narrative
+        The router reasons from genres, moods, time periods, and narrative
         themes extracted from the overviews — producing genuinely explainable
         recommendations rather than just parroting a title list back.
         """
-        if not self.gemini_model:
-            return "AI explanation unavailable: GEMINI_API_KEY missing from .env"
+        from backend.llm_router import llm_router
 
         # Build a theme digest from overviews — no titles included
         themes = []
@@ -345,44 +385,43 @@ class RecommendationEngine:
             f"Focus on mood, genre conventions, character archetypes, and storytelling style. "
             f"Do NOT mention any movie or show titles by name. "
             f"Be specific about themes — avoid generic phrases like 'you might enjoy these'. "
+            f"Keep your response concise. Do not explain your reasoning process. "
             f"Remember: your response language must match the detected query language."
         )
         try:
-            response = self.gemini_model.generate_content(prompt)
-            return f"🤖 **AI Recommendation Analysis:**\n\n{response.text}"
-        except Exception as e:
-            return f"Failed to generate explanation: {str(e)}"
+            text, provider = await llm_router.generate(
+                prompt=prompt,
+                max_tokens=400,
+                temperature=0.4,
+                task_name="rag_thematic_explanation",
+            )
+            return f"🤖 **AI Recommendation Analysis:**\n\n{text}"
+        except Exception as exc:
+            return f"Failed to generate explanation: {str(exc)}"
 
     def get_watch_providers(
         self,
         tmdb_id: int,
         media_type: str = "movie",
         regions: list = None,
+        title: str = "",
+        year: Optional[int] = None,
     ) -> list:
         """
         Fetch streaming availability from TMDB's /watch/providers endpoint with a
-        **per-region Redis cache layer** (24-hour TTL).
+        **per-region Redis cache layer** (24-hour TTL), then enrich sparse results
+        with JustWatch data.
+
+        Source labels
+        -------------
+        - ``"TMDB Watch Providers"``  — TMDB only (≥2 flatrate platforms found)
+        - ``"TMDB + JustWatch"``      — merged from both sources
+        - ``"JustWatch"``             — TMDB returned nothing, JustWatch filled it
 
         Cache key schema
         ----------------
         One key **per region**:  ``providers:{media_type}:{tmdb_id}:{REGION}``
         e.g. ``providers:movie:550:US``, ``providers:movie:550:IN``
-
-        Why per-region?
-        ~~~~~~~~~~~~~~~
-        A combined key (e.g. ``providers:movie:550:AU,CA,GB,IN,US``) causes a
-        cache miss whenever the caller requests any different subset of regions.
-        Per-region keys mean the Celery pre-warm can populate every region
-        independently and any caller subset gets full hits.
-
-        Request flow
-        ------------
-        1. ``mget`` all per-region keys in a single Redis round-trip.
-        2. Regions with a cache hit are deserialised immediately — zero TMDB calls.
-        3. Missing regions trigger a **single live TMDB call** (one HTTP request
-           always returns all regions at once; we just cherry-pick what we need).
-        4. Each newly fetched region is written back with ``SETEX`` (24 h TTL).
-        5. Cached + live providers are merged and returned.
 
         Redis unavailability
         --------------------
@@ -392,7 +431,7 @@ class RecommendationEngine:
         Returns
         -------
         List of dicts:
-          [{"provider": "Netflix", "type": "flatrate", "region": "US"}, ...]
+          [{"provider": "Netflix", "type": "flatrate", "region": "US", "source": "…"}, …]
         """
         if not self.tmdb_api_key:
             return []
@@ -454,9 +493,10 @@ class RecommendationEngine:
 
                 for stream_type in ["flatrate", "free", "ads", "rent", "buy"]:
                     for p in region_data.get(stream_type, []):
-                        name = p.get("provider_name", "").strip()
-                        if not name:
+                        raw_name = p.get("provider_name", "").strip()
+                        if not raw_name:
                             continue
+                        name = _norm_provider(raw_name)   # normalise alias
                         key = (name, stream_type)
                         if key not in seen:
                             seen.add(key)
@@ -465,8 +505,53 @@ class RecommendationEngine:
                                 "type":      stream_type,
                                 "region":    region,
                                 "logo_path": p.get("logo_path"),
-                                "source":    "JustWatch via TMDB",
+                                "source":    "TMDB Watch Providers",
                             })
+
+                # ── 5. JustWatch enrichment if TMDB flatrate result is sparse ───
+                tmdb_flatrate_count = sum(
+                    1 for rp in region_providers if rp["type"] == "flatrate"
+                )
+                if tmdb_flatrate_count < 2 and title:
+                    try:
+                        jw_client = get_justwatch_client()
+                        # JustWatch client is async; run it synchronously here
+                        loop = asyncio.new_event_loop()
+                        try:
+                            jw_platforms = loop.run_until_complete(
+                                jw_client.get_platforms(title, year=year)
+                            )
+                        finally:
+                            loop.close()
+                    except Exception:
+                        jw_platforms = []
+
+                    if jw_platforms:
+                        jw_names_norm = _norm_list(jw_platforms)
+                        existing_flatrate = {
+                            rp["provider"]
+                            for rp in region_providers
+                            if rp["type"] == "flatrate"
+                        }
+
+                        any_merged = False
+                        for jw_name in jw_names_norm:
+                            if jw_name not in existing_flatrate:
+                                existing_flatrate.add(jw_name)
+                                region_providers.append({
+                                    "provider":  jw_name,
+                                    "type":      "flatrate",
+                                    "region":    region,
+                                    "logo_path": None,
+                                    "source":    "JustWatch",
+                                })
+                                any_merged = True
+
+                        # Re-label TMDB entries if we merged JustWatch data
+                        if any_merged:
+                            for rp in region_providers:
+                                if rp["source"] == "TMDB Watch Providers":
+                                    rp["source"] = "TMDB + JustWatch"
 
                 _redis_safe_call(
                     lambda rc, r=region, rp=region_providers: rc.setex(
@@ -665,6 +750,83 @@ class RecommendationEngine:
         candidates = sorted(candidates, key=lambda x: x["similarity_score"], reverse=True)[:top_k]
         return candidates
 
+    def _raw_faiss_fallback_search(
+        self,
+        query: str,
+        db,
+        top_k: int,
+        media_type: str,
+        min_rating: float,
+        user_likes: list,
+        user_dislikes: list,
+    ) -> list:
+        """
+        Tertiary vector-search fallback using the in-process FAISSFallback index
+        (IndexFlatIP + L2 normalisation → cosine similarity).
+
+        On first call the index is lazily populated from the ``media`` table.
+        Subsequent calls reuse the cached singleton, making this instant.
+
+        Returns the same candidate-dict schema as _pgvector_search and
+        _faiss_search so the rest of the pipeline is unaffected.
+        """
+        print("[RecommendationEngine] Tertiary fallback: raw FAISSFallback search.")
+
+        idx = get_faiss_fallback()
+        if not idx.is_ready():
+            # Lazily populate if startup hook hasn’t run yet
+            n = populate_faiss_fallback_from_db(db)
+            print(f"[RecommendationEngine] FAISSFallback lazily loaded {n} vectors.")
+            if not idx.is_ready():
+                return []
+
+        query_vec = np.array(self._safe_embed(query), dtype=np.float32)
+        hits = idx.search(query_vec, top_k * 3)   # over-fetch for post-filter
+
+        candidates = []
+        for media_db_id, score in hits:
+            media_record = db.query(Media).filter(Media.id == media_db_id).first()
+            if not media_record:
+                continue
+
+            if media_type != "All":
+                norm = media_type.lower().replace(" shows", "").replace("movies", "movie")
+                if media_record.media_type != norm:
+                    continue
+
+            rec_rating = float(getattr(media_record, "vote_average", None) or
+                               getattr(media_record, "rating", None) or 0)
+            if rec_rating < min_rating:
+                continue
+
+            collab_boost = 0.0
+            tmdb_id = int(media_record.tmdb_id)
+            if tmdb_id in user_likes:
+                collab_boost = 0.2
+            elif tmdb_id in user_dislikes:
+                collab_boost = -0.3
+
+            combined = (score * 0.7) + (rec_rating / 10.0 * 0.3) + collab_boost
+
+            candidates.append({
+                "id":              tmdb_id,
+                "db_id":           int(media_record.id),
+                "title":           media_record.title,
+                "overview":        media_record.overview,
+                "release_date":    media_record.release_date,
+                "rating":          rec_rating,
+                "poster_path":     media_record.poster_path,
+                "media_type":      media_record.media_type,
+                "similarity_score": float(score),
+                "combined_score":   combined,
+                "original_doc":    None,
+            })
+
+            if len(candidates) >= top_k:
+                break
+
+        return candidates
+
     def _tfidf_search(
         self,
         query: str,
@@ -767,20 +929,16 @@ class RecommendationEngine:
         db = SessionLocal()
         user_likes, user_dislikes = [], []
         if user_id:
-            interactions = db.query(Interaction).filter(Interaction.user_id == user_id).all()
-            user_likes    = [i.tmdb_id for i in interactions if i.interaction_type == "like"]
-            user_dislikes = [i.tmdb_id for i in interactions if i.interaction_type == "dislike"]
+            interactions = db.query(EnhancedInteraction).filter(EnhancedInteraction.user_id == user_id).all()
+            user_likes    = [i.media_id for i in interactions if i.interaction_type == "like"]
+            user_dislikes = [i.media_id for i in interactions if i.interaction_type == "dislike"]
 
-        # Delegate to the appropriate search backend
-        # The routing order is:
-        #   1. pgvector (PostgreSQL)   — if available
-        #   2. FAISS                   — if index loaded
-        #   3. TF-IDF keyword search   — always available, pure-Python fallback
-        #
-        # _safe_embed() handles dimension mismatches transparently for paths 1 & 2.
-        # If a dimension error somehow escapes _safe_embed (e.g. the pgvector column
-        # rejects the projected vector due to schema mismatch), we catch it and
-        # transparently retry with TF-IDF so the endpoint never returns a 500.
+        # Delegate to the appropriate search backend.
+        # Four-tier routing order (highest quality first):
+        #   1. pgvector (PostgreSQL) — native cosine distance, best quality
+        #   2. LangChain FAISS         — if pgvector unavailable or fails
+        #   3. Raw FAISSFallback        — if LangChain FAISS also fails
+        #   4. TF-IDF keyword search   — always available, zero-dependency last resort
         try:
             if self.use_pgvector:
                 candidates = self._pgvector_search(
@@ -791,22 +949,31 @@ class RecommendationEngine:
                     query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
                 )
             else:
-                # No vector index is loaded at all — go straight to TF-IDF
-                candidates = self._tfidf_search(
-                    query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
+                # Neither pgvector nor LangChain FAISS — try raw FAISSFallback first
+                candidates = self._raw_faiss_fallback_search(
+                    query, db, top_k, media_type, min_rating, user_likes, user_dislikes
                 )
         except Exception as vector_err:
             print(
-                f"[RecommendationEngine] Vector search failed ({vector_err}). "
-                f"Falling back to TF-IDF keyword search."
+                f"[RecommendationEngine] Primary/secondary vector search failed ({vector_err}). "
+                f"Trying raw FAISSFallback."
             )
             try:
-                candidates = self._tfidf_search(
-                    query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
+                candidates = self._raw_faiss_fallback_search(
+                    query, db, top_k, media_type, min_rating, user_likes, user_dislikes
                 )
-            except Exception as tfidf_err:
-                print(f"[RecommendationEngine] TF-IDF fallback also failed: {tfidf_err}")
-                candidates = []
+            except Exception as faiss_err:
+                print(
+                    f"[RecommendationEngine] FAISSFallback also failed ({faiss_err}). "
+                    f"Falling back to TF-IDF keyword search."
+                )
+                try:
+                    candidates = self._tfidf_search(
+                        query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
+                    )
+                except Exception as tfidf_err:
+                    print(f"[RecommendationEngine] TF-IDF fallback also failed: {tfidf_err}")
+                    candidates = []
         finally:
             db.close()
 
