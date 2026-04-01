@@ -44,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ── Auth & Rate Limiting ──────────────────────────────────────────────────────
 from backend.auth import get_current_user, require_admin, router as auth_router
+from backend.routers.mood import router as mood_router
 
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -80,7 +81,7 @@ except ImportError:
 from backend.enhanced_database import (
     get_db, User, Media, StreamingPlatform, EnhancedInteraction,
     UserReview, RecommendationCache, TrendingMedia, SearchAnalytics,
-    init_enhanced_db, get_db
+    init_enhanced_db, WatchProgress
 )
 from backend.ai_explainer import get_ai_explainer
 from backend.advanced_recommendation_engine import AdvancedRecommendationEngine
@@ -123,6 +124,10 @@ if SLOWAPI_AVAILABLE and limiter:
 
 # Mount auth router (provides /token endpoint)
 app.include_router(auth_router)
+
+# Mount mood/vision router
+app.include_router(mood_router)
+
 
 # ── Global singletons ─────────────────────────────────────────────────────────
 embeddings = None
@@ -190,6 +195,23 @@ def initialize_services():
 # Initialize in background to not block Uvicorn startup
 threading.Thread(target=initialize_services, daemon=True).start()
 
+def _prewarm_embedding_cache():
+    """Pre-embed common mood queries so first searches are instant."""
+    common_queries = [
+        "romantic movie", "action thriller", "feel good comedy",
+        "sci-fi adventure", "horror", "documentary", "animated"
+    ]
+    try:
+        from backend.rag_chain import rag_chain_instance
+        if rag_chain_instance and rag_chain_instance.embeddings:
+            for q in common_queries:
+                rag_chain_instance.embeddings.embed_query(q)
+            print("[OK] Embedding cache pre-warmed.")
+    except Exception as e:
+        print(f"Failed to pre-warm cache: {e}")
+
+threading.Thread(target=_prewarm_embedding_cache, daemon=True).start()
+
 
 # ── Pydantic request/response models ─────────────────────────────────────────
 
@@ -242,6 +264,10 @@ class DeepAnalyzeRequest(BaseModel):
     query: str
     candidate_tmdb_ids: List[int] = Field(..., description="List of TMDB IDs of media to analyze.")
 
+class ProgressUpdate(BaseModel):
+    user_id: str
+    tmdb_id: int
+    progress: float
 
 # ── Startup / Lifecycle ───────────────────────────────────────────────────────
 
@@ -683,10 +709,11 @@ async def enhance_query(raw_query: str) -> str:
 # ── Core Recommendation Endpoint ──────────────────────────────────────────────
 
 @app.post("/api/recommend")
+@limiter.limit("10/minute")
 async def get_enhanced_recommendations(
     user_query: UserQuery,
     background_tasks: BackgroundTasks,
-    http_request: Request,
+    request: Request,
     db: Session = Depends(get_db),
 ):
     """Get hybrid AI-powered recommendations with multilingual + Tenglish + mood support."""
@@ -939,19 +966,20 @@ async def get_enhanced_recommendations(
             # Maintain ranking order
             media_dict = {m.db_id: m for m in media_objects}
             ordered_media = [media_dict[db_id] for db_id in candidate_ids if db_id in media_dict]
-            # 5. Synchronous Explanation Generation (To pass QA test)
+            # 5. Background Explanation Generation 
             top_5_media = ordered_media[:5]
-            explanations_result = {}
-            explanation_provider_used = "unknown"
-            try:
-                from backend.ai_explainer import generate_explanations
-                explanations_result, explanation_provider_used = await generate_explanations(
-                    original_query, top_5_media, detected_lang
-                )
-            except Exception as e:
-                print(f"Explanation generation failed: {e}")
+            job_id = str(uuid.uuid4())
             
-            # 6. Assemble Response Payload
+            # Add to background tasks to return movies instantly
+            background_tasks.add_task(
+                _generate_and_cache_explanation,
+                user_query.user_id, # Can use job_id but here we'll map multiple item IDs
+                original_query,
+                top_5_media,
+                detected_lang
+            )
+            
+            # 6. Assemble Response Payload (without synchronous explanation)
             final_results = []
             for c in final_candidates:
                 m = media_dict.get(c["db_id"])
@@ -960,9 +988,6 @@ async def get_enhanced_recommendations(
                     
                 tmdb_id = int(m.tmdb_id)
                 sim_factors = compute_similarity_factors(m, original_query, float(c["similarity_score"]))
-                
-                # Use synchronously generated explanation, with a fallback if empty
-                item_explanation = explanations_result.get(tmdb_id, "This title strongly matches the mood and themes of your search.")
 
                 final_results.append({
                     "media": {
@@ -980,14 +1005,16 @@ async def get_enhanced_recommendations(
                             p.country: [p.name] for p in m.platforms
                         } if m.platforms else {},
                     },
-                    "explanation": item_explanation,
-                    "explanation_provider": explanation_provider_used,
+                    "explanation": None,
+                    "explanation_provider": None,
                     "similarity_factors": sim_factors
                 })
 
             response_data = {
-                "explanation": "", # Overall explanation will be empty for now, fetched per item
+                "explanation": "", # Overall explanation not used per item
                 "movies": final_results,
+                "explanation_ready": False,
+                "explanation_job_id": job_id,
                 "query": original_query,
                 "translated_query": translated_query if translated_query != original_query else None,
                 "detected_language": detected_lang,
@@ -1606,6 +1633,168 @@ async def get_user_stats(user_id: str, db: Session = Depends(get_db)):
             db.query(EnhancedInteraction)
             .filter(EnhancedInteraction.user_id == user_id)
             .all()
+            .all()
+        )
+        return {
+            "recent_searches": [
+                {
+                    "query": s.query,
+                    "language": s.query_language,
+                    "results": s.results_count,
+                    "timestamp": s.timestamp.isoformat(),
+                }
+                for s in recent
+            ]
+        }
+    except Exception as e:
+        return {"recent_searches": []}
+
+
+# Helper functions have been deduplicated to the top of the file
+
+# ── Bonus Verification Endpoints ──────────────────────────────────────────────
+
+@app.get("/api/similar/{tmdb_id}")
+async def get_similar_titles(tmdb_id: int, db: Session = Depends(get_db)):
+    """Finds similar titles via local FAISS index (fallback from pgvector)."""
+    from backend.rag_chain import rag_chain_instance
+    # 1. Lookup item in DB to get title/overview for vector search
+    item = db.query(Media).filter(Media.tmdb_id == tmdb_id).first()
+    if not item:
+        raise HTTPException(404, "Item not found")
+        
+    if not rag_chain_instance.vector_store:
+        raise HTTPException(503, "Vector store not initialized")
+
+    query_str = f"{item.title}: {item.overview}"
+    similar_docs = rag_chain_instance.vector_store.similarity_search(query_str, k=9)
+
+    similar_results = []
+    for doc in similar_docs:
+        sid = doc.metadata.get("tmdb_id")
+        if sid == tmdb_id:
+            continue
+        m = db.query(Media).filter(Media.tmdb_id == sid).first()
+        if m:
+            similar_results.append({
+                "id": int(m.db_id),
+                "title": m.title,
+                "poster_path": _format_poster_url(m.poster_path),
+                "rating": float(m.rating or 0.0),
+                "media_type": m.media_type,
+                "release_year": m.release_date.split("-")[0] if m.release_date else None,
+                "genres": m.genres or []
+            })
+    return similar_results[:8]
+
+# ── Admin Routes ──────────────────────────────────────────────────────────────
+
+class ManageSourceRequest(BaseModel):
+    source_type: str   # "csv" | "url"
+    source: str        # file path or URL
+    media_type: str = "movie"  # "movie" | "tv"
+
+
+@app.post("/api/admin/update_db")
+async def admin_update_db(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin: dict = Depends(require_admin),
+):
+    """Admin: trigger a TMDB trending refresh (updates TrendingMedia table)."""
+    try:
+        if TASKS_AVAILABLE:
+            background_tasks.add_task(dispatch_refresh_trending)
+            return {"status": "queued", "message": "Trending refresh dispatched (Celery or background thread)."}
+        else:
+            # Inline synchronous refresh
+            from backend.tasks import _do_refresh_trending
+            background_tasks.add_task(_do_refresh_trending)
+            return {"status": "queued", "message": "Trending refresh dispatched as background task."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Admin update_db error: {str(e)}")
+
+
+@app.post("/api/admin/manage_sources")
+async def admin_manage_sources(
+    request: ManageSourceRequest,
+    background_tasks: BackgroundTasks,
+    admin: dict = Depends(require_admin),
+):
+    """
+    Admin: register a new CSV or URL data source for ingestion.
+    Queues a background ingest task.
+    """
+    import pathlib
+
+    if request.source_type == "csv":
+        p = pathlib.Path(request.source)
+        if not p.exists():
+            raise HTTPException(status_code=400, detail=f"CSV file not found: {request.source}")
+        if p.suffix.lower() != ".csv":
+            raise HTTPException(status_code=400, detail="source must be a .csv file.")
+        source_abs = str(p.resolve())
+    elif request.source_type == "url":
+        if not request.source.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="source must be a valid http/https URL.")
+        source_abs = request.source
+    else:
+        raise HTTPException(status_code=400, detail="source_type must be 'csv' or 'url'.")
+
+    def _run_ingest(source: str, source_type: str, media_type: str):
+        """Background ingest task."""
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.dirname(__file__))
+            if source_type == "csv":
+                import pandas as pd
+                from backend.enhanced_database import get_db_session, Media
+                df = pd.read_csv(source, dtype=str).fillna("")
+                db2 = get_db_session()
+                added = 0
+                for _, row in df.iterrows():
+                    tmdb_id = row.get("id") or row.get("tmdb_id", "")
+                    if not tmdb_id:
+                        continue
+                    exists = db2.query(Media).filter(Media.tmdb_id == int(tmdb_id)).first()
+                    if exists:
+                        continue
+                    db2.add(Media(
+                        tmdb_id=int(tmdb_id),
+                        title=row.get("title", "Unknown"),
+                        overview=row.get("overview", ""),
+                        release_date=row.get("release_date", ""),
+                        rating=float(row.get("vote_average") or 0),
+                        poster_path=row.get("poster_path", ""),
+                        media_type=media_type,
+                    ))
+                    added += 1
+                db2.commit()
+                db2.close()
+                print(f"[admin/manage_sources] Ingested {added} new titles from {source}")
+            elif source_type == "url":
+                print(f"[admin/manage_sources] URL ingestion queued for: {source} (implement custom scraper)")
+        except Exception as e:
+            print(f"[admin/manage_sources] Ingest error: {e}")
+
+    background_tasks.add_task(_run_ingest, source_abs, request.source_type, request.media_type)
+    return {
+        "status": "queued",
+        "message": f"Ingest of '{source_abs}' (type={request.source_type}) dispatched.",
+        "source_type": request.source_type,
+        "media_type": request.media_type,
+    }
+
+
+# ── User Stats Endpoint ───────────────────────────────────────────────────────
+
+@app.get("/api/user_stats/{user_id}")
+async def get_user_stats(user_id: str, db: Session = Depends(get_db)):
+    try:
+        interactions = (
+            db.query(EnhancedInteraction)
+            .filter(EnhancedInteraction.user_id == user_id)
+            .all()
         )
         movies_liked = sum(
             1 for i in interactions
@@ -1751,7 +1940,169 @@ async def get_genre_cooccurrence():
 
 # END OF FILE OR ROUTES
 
+explanation_cache = {}
+
+async def _generate_and_cache_explanation(user_id, query, top_media, lang):
+    """Background task to generate explanations for media items and store them in the cache."""
+    try:
+        from backend.ai_explainer import generate_explanations
+        explanations_result, explanation_provider_used = await generate_explanations(
+            query, top_media, lang
+        )
+        for tmdb_id, text in explanations_result.items():
+            explanation_cache[str(tmdb_id)] = {
+                "explanation": text,
+                "provider": explanation_provider_used
+            }
+    except Exception as e:
+        print(f"[BACKGROUND TASK] Explanation generation failed: {e}")
+
+@app.get("/api/explanation/{job_id}")
+async def get_explanation(job_id: str):
+    """Endpoint for the frontend to poll for explanation results by tmdb_id."""
+    if job_id in explanation_cache:
+        cached_data = explanation_cache[job_id]
+        return {
+            "ready": True, 
+            "explanation": cached_data["explanation"], 
+            "provider": cached_data["provider"]
+        }
+    return {"ready": False, "explanation": None}
+
+
+@app.get("/api/because-you-watched/{tmdb_id}")
+async def because_you_watched(tmdb_id: int, db: Session = Depends(get_db)):
+    """Find movies similar to a specific title the user has interacted with."""
+    item = db.query(Media).filter(Media.tmdb_id == tmdb_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Title not found")
+
+    # Build a rich semantic query from the seed item's metadata
+    query = f"{item.title} {' '.join(item.genres or [])} {' '.join((item.keywords or [])[:10])}"
+
+    from backend.rag_chain import rag_chain_instance
+    if not rag_chain_instance or not rag_chain_instance.vector_store:
+        raise HTTPException(status_code=500, detail="Vector store not initialized")
+
+    # Fetch top 12 to filter out the seed movie itself
+    similar_docs = rag_chain_instance.vector_store.similarity_search(query, k=12)
+
+    results = []
+    seen_ids = {tmdb_id}  # Exclude the seed item
+    for doc in similar_docs:
+        sid = doc.metadata.get("tmdb_id")
+        if not sid or int(sid) in seen_ids:
+            continue
+        seen_ids.add(int(sid))
+        m = db.query(Media).filter(Media.tmdb_id == int(sid)).first()
+        if m and len(results) < 8:
+            results.append({
+                "tmdb_id": int(m.tmdb_id),
+                "title": m.title,
+                "poster_path": f"https://image.tmdb.org/t/p/w500{m.poster_path}" if m.poster_path else "",
+                "rating": float(m.rating or 0),
+                "genres": m.genres or [],
+                "media_type": m.media_type,
+                "release_date": m.release_date or "",
+            })
+
+    return {"seed_title": item.title, "recommendations": results}
+
+
+@app.post("/api/progress")
+async def update_progress(data: ProgressUpdate, db: Session = Depends(get_db)):
+    """Update or create watch progress for a user and movie."""
+    media = db.query(Media).filter(Media.tmdb_id == data.tmdb_id).first()
+    if not media:
+        raise HTTPException(404, "Media not found")
+        
+    existing = db.query(WatchProgress).filter(
+        WatchProgress.user_id == data.user_id,
+        WatchProgress.tmdb_id == data.tmdb_id
+    ).first()
+    
+    if existing:
+        existing.progress_percent = data.progress
+        existing.last_watched = datetime.utcnow()
+        existing.completed = data.progress >= 90.0 # Auto-complete at 90%
+    else:
+        new_progress = WatchProgress(
+            user_id=data.user_id, 
+            tmdb_id=data.tmdb_id, 
+            progress_percent=data.progress,
+            completed=data.progress >= 90.0
+        )
+        db.add(new_progress)
+        
+    db.commit()
+    return {"status": "success", "progress": data.progress}
+
+
+@app.get("/api/progress/{user_id}")
+async def get_active_progress(user_id: str, db: Session = Depends(get_db)):
+    """Fetch all incomplete media the user is currently watching."""
+    active_watches = db.query(WatchProgress).filter(
+        WatchProgress.user_id == user_id,
+        WatchProgress.completed == False,
+        WatchProgress.progress_percent > 0
+    ).order_by(WatchProgress.last_watched.desc()).all()
+    
+    results = []
+    for watch in active_watches:
+        media = db.query(Media).filter(Media.tmdb_id == watch.tmdb_id).first()
+        if media:
+            results.append({
+                "tmdb_id": media.tmdb_id,
+                "title": media.title,
+                "poster_path": f"https://image.tmdb.org/t/p/w500{media.poster_path}" if media.poster_path else "",
+                "progress_percent": watch.progress_percent
+            })
+            
+    return results
+
+
+@app.get("/api/taste-profile/{user_id}")
+async def get_taste_profile(user_id: str, db: Session = Depends(get_db)):
+    """Aggregates a user's likes and watchlists to determine their taste profile."""
+    interactions = db.query(EnhancedInteraction).filter(
+        EnhancedInteraction.user_id == user_id,
+        EnhancedInteraction.interaction_type.in_(["like", "love", "watchlist"])
+    ).all()
+
+    genre_counts: Dict[str, int] = {}
+    decade_counts: Dict[str, int] = {}
+    language_counts: Dict[str, int] = {}
+
+    for inter in interactions:
+        if inter.media:
+            for g in (inter.media.genres or []):
+                genre_counts[g] = genre_counts.get(g, 0) + 1
+
+            year = (inter.media.release_date or "")[:4]
+            if year.isdigit():
+                decade = f"{year[:3]}0s"
+                decade_counts[decade] = decade_counts.get(decade, 0) + 1
+
+            lang = inter.media.original_language or "en"
+            language_counts[lang] = language_counts.get(lang, 0) + 1
+
+    return {
+        "genres": [
+            {"name": k, "count": v}
+            for k, v in sorted(genre_counts.items(), key=lambda x: -x[1])[:8]
+        ],
+        "decades": [
+            {"name": k, "count": v}
+            for k, v in sorted(decade_counts.items())
+        ],
+        "languages": [
+            {"name": k, "count": v}
+            for k, v in sorted(language_counts.items(), key=lambda x: -x[1])[:5]
+        ],
+        "total_interactions": len(interactions),
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
-    # Use 8005 as a fresh port to avoid any lingering zombie processes on 8000
-    uvicorn.run(app, host="0.0.0.0", port=8005, reload=False)
+    uvicorn.run("enhanced_main:app", host="0.0.0.0", port=8005, reload=True)

@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth } from '../context/AuthContext';
-import { Bookmark, LogOut, User, Menu, X, Compass, Sparkles } from 'lucide-react';
+import { Bookmark, LogOut, User, Menu, X, Compass, Sparkles, BarChart2 } from 'lucide-react';
 import MiraiLogo from './MiraiLogo';
 
 const Layout = () => {
@@ -59,6 +59,9 @@ const Layout = () => {
             <NavLink to="/watchlist" className={navLinkClass}>
               <Bookmark size={14} /> Watchlist
             </NavLink>
+            <NavLink to="/profile" className={navLinkClass}>
+              <BarChart2 size={14} /> Taste Profile
+            </NavLink>
           </nav>
 
           {/* User + logout */}
@@ -102,6 +105,9 @@ const Layout = () => {
                 </NavLink>
                 <NavLink to="/watchlist" className={navLinkClass} onClick={() => setMobileMenuOpen(false)}>
                   <Bookmark size={14} /> Watchlist
+                </NavLink>
+                <NavLink to="/profile" className={navLinkClass} onClick={() => setMobileMenuOpen(false)}>
+                  <BarChart2 size={14} /> Taste Profile
                 </NavLink>
                 <div className="pt-3 border-t border-white/5 mt-2 flex items-center justify-between">
                   <span className="text-slate-400 text-sm flex items-center gap-2">

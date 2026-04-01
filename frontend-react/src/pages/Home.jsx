@@ -5,12 +5,13 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   Search, Star, Heart, ThumbsDown, BookmarkPlus,
-  SlidersHorizontal, ChevronDown, ChevronUp, Loader2,
-  Tv, Film, Globe, Layers, Sparkles, AlertCircle, X,
+  Tv, Film, Globe, Layers, Sparkles, AlertCircle, X, Camera, Play
 } from 'lucide-react';
 import { getRecommendations, rateTitle, manageWatchlist } from '../services/api';
 import { useAuth } from '../context/AuthContext';
 import { useAppContext } from '../context/AppContext';
+import PlatformFilter from '../components/PlatformFilter';
+import ContinueWatching from '../components/ContinueWatching';
 
 // ── Filter options ─────────────────────────────────────────────────────────────
 const GENRES = ['Action', 'Comedy', 'Drama', 'Horror', 'Romance', 'Sci-Fi', 'Thriller', 'Animation', 'Documentary'];
@@ -259,6 +260,29 @@ const MovieCard = ({ movie, ratingState = {}, pending, onRate, index }) => {
           >
             <BookmarkPlus size={12} />
           </motion.button>
+          
+          <motion.button
+            whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}
+            disabled={isPending}
+            onClick={async () => {
+              try {
+                const user_id = localStorage.getItem('mirai_user_id') || 'demo_user';
+                await fetch('/api/progress', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ user_id, tmdb_id: movie.id, progress: 45.0 })
+                });
+                toast.success(`Watching ${movie.title}...`);
+                window.dispatchEvent(new Event('progress:updated')); // trigger re-fetch if we listen? The simplest is reload or just it'll load next time.
+              } catch (e) {
+                console.error(e);
+              }
+            }}
+            className="px-3 py-2 rounded-xl text-xs font-semibold border transition-all border-white/10 text-slate-400 hover:border-emerald-500/30 hover:text-emerald-500 hover:bg-emerald-500/5"
+            title="Simulate Watch (45%)"
+          >
+            <Play size={12} />
+          </motion.button>
         </div>
       </div>
     </motion.div>
@@ -288,6 +312,11 @@ const Home = () => {
   const [minRating, setMinRating] = useState(0);
   const [ratingState, setRatingState] = useState({});
   const [pending, setPending]         = useState(new Set());
+  const imageInputRef = React.useRef(null);
+  const [imageLoading, setImageLoading] = useState(false);
+  const [similarMovies, setSimilarMovies] = useState([]);
+  const [seedMovieTitle, setSeedMovieTitle] = useState('');
+  const [selectedPlatform, setSelectedPlatform] = useState(null);
 
   useEffect(() => {
     fetchMetrics();
@@ -301,6 +330,50 @@ const Home = () => {
       if (res.ok) setMetrics(await res.json());
     } catch (err) {
       console.error('Failed to fetch metrics', err);
+    }
+  };
+
+  const fetchSimilarMovies = async (tmdbId) => {
+    try {
+      const res = await fetch(`/api/because-you-watched/${tmdbId}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.recommendations?.length) {
+        setSeedMovieTitle(data.seed_title);
+        setSimilarMovies(data.recommendations);
+      }
+    } catch (err) {
+      console.error('Failed to fetch similar movies:', err);
+    }
+  };
+
+  const handleImageUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+    setImageLoading(true);
+    setQuery('Analyzing visual mood...');
+    const formData = new FormData();
+    formData.append('file', file);
+    try {
+      const response = await fetch('/api/mood-from-image', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!response.ok) throw new Error('Failed to analyze image');
+      const data = await response.json();
+      setQuery(data.extracted_query);
+      // Auto-trigger search with the extracted query
+      setTimeout(() => {
+        document.getElementById('search-btn')?.click();
+      }, 100);
+    } catch (error) {
+      console.error('Error analyzing image:', error);
+      toast.error('Could not analyze image. Try another one.');
+      setQuery('');
+    } finally {
+      setImageLoading(false);
+      // Reset the input so the same file can be re-uploaded
+      if (imageInputRef.current) imageInputRef.current.value = '';
     }
   };
 
@@ -324,7 +397,8 @@ const Home = () => {
         media_type: mediaType,
         min_rating: minRating,
         genre: genre || null,
-        language_filter: language,   // FIX Issue 2: must match UserQuery field name
+        language_filter: language,
+        platforms: selectedPlatform ? [selectedPlatform] : null,
       });
       const normalized = (data.movies || data.results || []).map(item => {
         // Support both flat format and nested {media, explanation, similarity_factors} format
@@ -407,6 +481,10 @@ const Home = () => {
         next === 'watchlist' ? `Added "${title}" to Watchlist` :
         `Removed rating for "${title}"`
       );
+      // Trigger "Because you watched" on positive interactions
+      if ((type === 'watchlist' || type === RATING_LIKE) && next !== RATING_NONE) {
+        fetchSimilarMovies(tmdbId);
+      }
     } catch {
       setRatingState((s) => ({ ...s, [tmdbId]: prev }));
       toast.error('Could not save rating.');
@@ -474,7 +552,25 @@ const Home = () => {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="e.g. dark psychological thriller, feel-good Bollywood, Akira Kurosawa style…"
-              className="w-full glow-input text-white placeholder-slate-600 rounded-2xl pl-11 pr-4 py-4 text-sm outline-none font-body"
+              className="w-full glow-input text-white placeholder-slate-600 rounded-2xl pl-11 pr-12 py-4 text-sm outline-none font-body"
+            />
+            {/* Camera / Visual Mood button */}
+            <button
+              type="button"
+              title="Search by image mood"
+              onClick={() => imageInputRef.current?.click()}
+              className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-500 hover:text-accent hover:bg-accent/10 transition-colors"
+            >
+              {imageLoading
+                ? <Loader2 size={15} className="animate-spin" />
+                : <Camera size={15} />}
+            </button>
+            <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={handleImageUpload}
             />
           </div>
           <motion.button
@@ -489,6 +585,11 @@ const Home = () => {
           </motion.button>
         </motion.div>
       </form>
+
+      {/* ── Platform Filter ─────────────────────────────────────────── */}
+      <div className="max-w-3xl mx-auto mb-3">
+        <PlatformFilter selected={selectedPlatform} onChange={setSelectedPlatform} />
+      </div>
 
       {/* ── Filter toggle ──────────────────────────────────────────────── */}
       <div className="flex justify-center mb-6">
@@ -593,6 +694,8 @@ const Home = () => {
         )}
       </AnimatePresence>
 
+      <ContinueWatching />
+
       {/* ── AI Explanation ──────────────────────────────────────────────── */}
       {explanation && !results.some(r => r.explanation) && (
         <motion.div
@@ -687,6 +790,55 @@ const Home = () => {
             ))}
           </div>
         </div>
+      )}
+
+      {/* ── Because You Watched Carousel ─────────────────────────────────── */}
+      {similarMovies.length > 0 && (
+        <motion.div
+          className="mt-12 w-full"
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.5 }}
+        >
+          <div className="flex items-center gap-3 mb-5">
+            <Sparkles size={16} className="text-accent" />
+            <h3 className="text-lg font-display font-semibold text-white">
+              Because you liked{' '}
+              <span className="text-accent">{seedMovieTitle}</span>
+            </h3>
+          </div>
+          <div className="flex gap-4 overflow-x-auto pb-4" style={{ scrollbarWidth: 'thin' }}>
+            {similarMovies.map((movie) => (
+              <motion.div
+                key={movie.tmdb_id}
+                whileHover={{ scale: 1.04 }}
+                className="min-w-[160px] flex-shrink-0 cursor-pointer"
+                onClick={() => setQuery(movie.title)}
+              >
+                {movie.poster_path ? (
+                  <img
+                    src={movie.poster_path}
+                    alt={movie.title}
+                    loading="lazy"
+                    className="w-full h-[240px] object-cover rounded-xl shadow-lg"
+                  />
+                ) : (
+                  <div className="w-full h-[240px] bg-midnight-800 rounded-xl flex items-center justify-center">
+                    <Film size={32} className="text-slate-700" />
+                  </div>
+                )}
+                <p className="text-white text-xs font-medium mt-2 truncate font-body">{movie.title}</p>
+                <div className="flex items-center gap-1 mt-0.5">
+                  <Star size={9} className="text-accent" fill="currentColor" />
+                  <span className="text-slate-400 text-[10px] font-body">{movie.rating?.toFixed(1)}</span>
+                  {movie.media_type === 'tv'
+                    ? <Tv size={9} className="text-slate-600 ml-1" />
+                    : <Film size={9} className="text-slate-600 ml-1" />}
+                </div>
+              </motion.div>
+            ))}
+          </div>
+        </motion.div>
       )}
 
       {/* ── Loading skeleton ─────────────────────────────────────────── */}

@@ -163,6 +163,17 @@ class EnhancedInteraction(Base):
         Index('idx_timestamp', 'timestamp'),
     )
 
+class WatchProgress(Base):
+    __tablename__ = "watch_progress"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True) 
+    tmdb_id = Column(Integer, index=True) 
+    progress_percent = Column(Float, default=0.0)
+    last_watched = Column(DateTime, default=datetime.utcnow)
+    completed = Column(Boolean, default=False)
+
+
 class UserReview(Base):
     __tablename__ = "user_reviews"
 

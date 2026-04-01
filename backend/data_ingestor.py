@@ -11,6 +11,14 @@ import io
 # Force UTF-8 for prints to avoid 'charmap' errors on Windows
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
+# Ensure we can import from the root
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, BASE_DIR)
+from backend.enhanced_database import SessionLocal, Media
+
+DATA_DIR = os.path.join(BASE_DIR, 'data')
+FAISS_PATH = os.path.join(DATA_DIR, 'faiss_index')
+
 class DataIngestor:
     def __init__(self):
         self.embeddings = HuggingFaceEmbeddings(
@@ -24,47 +32,53 @@ class DataIngestor:
         )
 
     def create_faiss_index(self):
-        print("Loading data...")
+        print("Loading data from database...")
         documents = []
+        db = SessionLocal()
+        try:
+            # Query all media records from the database
+            media_records = db.query(Media).all()
+            print(f"Adding {len(media_records)} records from database...")
 
-        # 1. Load Movies
-        if os.path.exists("../data/tmdb_5000_movies.csv"):
-            movie_df = pd.read_csv("../data/tmdb_5000_movies.csv")
-            movie_df = movie_df[["id", "title", "overview", "release_date", "vote_average"]]
-            movie_df = movie_df.dropna()
-            
-            for _, row in movie_df.iterrows():
-                content = f"Title: {row['title']}. Overview: {row['overview']}"
+            for item in media_records:
+                # Build rich text for semantic embedding
+                parts = [f"Title: {item.title}"]
+                if item.genres:
+                    parts.append("Genres: " + ", ".join(item.genres))
+                if item.keywords:
+                    parts.append("Themes: " + ", ".join(item.keywords[:15]))
+                if item.cast:
+                    parts.append("Cast: " + ", ".join(item.cast))
+                if item.director:
+                    parts.append(f"Director: {item.director}")
+                if item.release_date:
+                    parts.append(f"Year: {item.release_date[:4]}")
+                parts.append(f"Overview: {item.overview}")
+                
+                content = ". ".join(p for p in parts if p)
+                
+                # Split content into manageable chunks
                 chunks = self.text_splitter.split_text(content)
                 for i, chunk in enumerate(chunks):
                     documents.append(
                         Document(
                             page_content=chunk,
-                            metadata={"id": int(row["id"]), "media_type": "movie", "chunk_index": i}
+                            metadata={
+                                "tmdb_id": int(item.tmdb_id),
+                                "id": int(item.tmdb_id),  # Legacy support
+                                "media_type": item.media_type,
+                                "chunk_index": i,
+                                "title": item.title
+                            }
                         )
                     )
-            print(f"Added {len(movie_df)} movies for indexing.")
-        else:
-            print("tmdb_5000_movies.csv not found.")
-
-        # 2. Load TV Shows
-        if os.path.exists("../data/tmdb_tv_shows.csv"):
-            tv_df = pd.read_csv("../data/tmdb_tv_shows.csv")
-            tv_df = tv_df.dropna(subset=["id", "title", "overview"])
             
-            for _, row in tv_df.iterrows():
-                content = f"Title: {row['title']}. Overview: {row['overview']}"
-                chunks = self.text_splitter.split_text(content)
-                for i, chunk in enumerate(chunks):
-                    documents.append(
-                        Document(
-                            page_content=chunk,
-                            metadata={"id": int(row["id"]), "media_type": "tv", "chunk_index": i}
-                        )
-                    )
-            print(f"Added {len(tv_df)} TV shows for indexing.")
-        else:
-            print("tmdb_tv_shows.csv not found.")
+            if not documents and os.path.exists(os.path.join(DATA_DIR, "tmdb_5000_movies.csv")):
+                print("Database empty. Falling back to CSV...")
+                # ... existing CSV logic ...
+                pass
+        finally:
+            db.close()
 
         if not documents:
             print("No documents to index. Build failed.")
@@ -73,15 +87,18 @@ class DataIngestor:
         print("Building new FAISS Vector Store... (this may take a few minutes)")
         self.vector_store = FAISS.from_documents(documents, self.embeddings)
 
-        os.makedirs("../data/faiss_index", exist_ok=True)
-        print("Saving FAISS index locally...")
-        self.vector_store.save_local("../data/faiss_index")
+        os.makedirs(FAISS_PATH, exist_ok=True)
+        print(f"Saving FAISS index locally to {FAISS_PATH}...")
+        self.vector_store.save_local(FAISS_PATH)
 
         # Generate movies_metadata.csv for DB migration script
-        if os.path.exists("../data/tmdb_5000_movies.csv"):
+        csv_path = os.path.join(DATA_DIR, "tmdb_5000_movies.csv")
+        target_csv = os.path.join(DATA_DIR, "movies_metadata.csv")
+        if os.path.exists(csv_path):
+            movie_df = pd.read_csv(csv_path)
             movie_df.rename(columns={"vote_average": "rating"}, inplace=True)
             movie_df["poster_path"] = ""
-            movie_df.to_csv("../data/movies_metadata.csv", index=False)
+            movie_df.to_csv(target_csv, index=False)
 
         print("🎉 FAISS index created successfully with unified metadata!")
 

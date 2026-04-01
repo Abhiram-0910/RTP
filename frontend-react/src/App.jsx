@@ -8,6 +8,7 @@ import Layout from './components/Layout';
 import CinematicIntro from './components/CinematicIntro';
 import Home from './pages/Home';
 import Watchlist from './pages/Watchlist';
+import Profile from './pages/Profile';
 import Login from './pages/Login';
 
 /** Redirect unauthenticated users to /login */
@@ -60,6 +61,7 @@ const AppRoutes = () => {
             >
               <Route index element={<Home />} />
               <Route path="watchlist" element={<Watchlist />} />
+              <Route path="profile" element={<Profile />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
