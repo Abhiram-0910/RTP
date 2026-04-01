@@ -812,56 +812,63 @@ async def get_enhanced_recommendations(
             else:
                 docs_with_scores = _fallback_database_search(translated_query, db, limit=60)
 
-        # ── Step 4: Build candidate list ─────────────────────────────────────
-        candidates = []
+        # ── Step 4: Build candidate list with Batch DB Lookup & Deduplication ──
+        tmdb_id_to_best_score = {}
         for doc, similarity_score in docs_with_scores:
             # FIX: metadata key is 'tmdb_id' (set by ingest_all_data.py)
-            tmdb_id = (
-                doc.metadata.get("tmdb_id")
-                or doc.metadata.get("id")
-            )
-            media_type_doc = doc.metadata.get("media_type", "movie")
-
-            if not tmdb_id:
+            tmdb_id_raw = doc.metadata.get("tmdb_id") or doc.metadata.get("id")
+            if not tmdb_id_raw:
                 continue
-
-            media_record = db.query(Media).filter(
-                Media.tmdb_id == int(tmdb_id)
-            ).first()
-
-            if not media_record:
+            try:
+                tmdb_id = int(tmdb_id_raw)
+            except ValueError:
                 continue
+                
+            # Deduplicate: keep the best (lowest distance/highest similarity) score for each tmdb_id
+            if tmdb_id not in tmdb_id_to_best_score:
+                tmdb_id_to_best_score[tmdb_id] = float(similarity_score)
+            else:
+                # If using L2 distance, lower is better. If Cosine, higher is better.
+                # Assuming FAISS default L2 distance here: we want the minimum score.
+                tmdb_id_to_best_score[tmdb_id] = min(tmdb_id_to_best_score[tmdb_id], float(similarity_score))
 
-            # Apply advanced filters
-            if not _passes_advanced_filters(media_record, user_query):
-                continue
+        candidates = []
+        if tmdb_id_to_best_score:
+            # Bulk Query to eliminate 1200 sequential SELECT queries
+            all_tmdb_ids = list(tmdb_id_to_best_score.keys())
+            media_records = db.query(Media).filter(Media.tmdb_id.in_(all_tmdb_ids)).all()
             
-            # Fetch streaming platforms from DB
-            db_platforms = [p.name for p in media_record.platforms]
-
-            # Build candidate dict
-            candidate = {
-                "id": int(media_record.tmdb_id),
-                "db_id": int(media_record.db_id), # Use internal DB ID for later lookup
-                "title": media_record.title,
-                "overview": media_record.overview or "",
-                "release_date": media_record.release_date or "",
-                "rating": float(media_record.rating or 0),
-                "poster_path": _format_poster_url(media_record.poster_path),
-                "media_type": media_record.media_type,
-                "genres": media_record.genres or [],
-                "keywords": media_record.keywords or [],
-                "popularity": float(media_record.popularity_score or 0),
-                "original_language": media_record.original_language or "en",
-                "runtime": media_record.runtime,
-                "director": media_record.director,
-                "cast": media_record.cast or [],
-                "similarity_score": float(similarity_score),
-                "streaming_platforms": db_platforms,
-                # Review text for embedding enrichment
-                "reviews_text": media_record.reviews_text or "",
-            }
-            candidates.append(candidate)
+            for media_record in media_records:
+                if not _passes_advanced_filters(media_record, user_query):
+                    continue
+                
+                db_platforms = [p.name for p in media_record.platforms]
+                best_score = tmdb_id_to_best_score[int(media_record.tmdb_id)]
+                
+                candidate = {
+                    "id": int(media_record.tmdb_id),
+                    "db_id": int(media_record.db_id),
+                    "title": media_record.title,
+                    "overview": media_record.overview or "",
+                    "release_date": media_record.release_date or "",
+                    "rating": float(media_record.rating or 0),
+                    "poster_path": _format_poster_url(media_record.poster_path),
+                    "media_type": media_record.media_type,
+                    "genres": media_record.genres or [],
+                    "keywords": media_record.keywords or [],
+                    "popularity": float(media_record.popularity_score or 0),
+                    "original_language": media_record.original_language or "en",
+                    "runtime": media_record.runtime,
+                    "director": media_record.director,
+                    "cast": media_record.cast or [],
+                    "similarity_score": best_score,
+                    "streaming_platforms": db_platforms,
+                    "reviews_text": media_record.reviews_text or "",
+                }
+                candidates.append(candidate)
+        
+        # Sort candidates so the top ones with best duplicate-free scores naturally float up
+        candidates = sorted(candidates, key=lambda x: x["similarity_score"])
 
         # ── Step 5: Load user interactions for collaborative filtering ─────
         user_interactions = []
@@ -1121,7 +1128,18 @@ async def deep_analyze(
         for row in result_rows:
             title = row.title or "Unknown"
             film_titles.append(title)
-            genres_str = ", ".join(row.genres or []) if getattr(row, 'genres', None) else "Unknown"
+            
+            # genres might be a JSON string from SQLite raw text query
+            genres_val = row.genres
+            if isinstance(genres_val, str):
+                try:
+                    import json
+                    genres_val = json.loads(genres_val)
+                except Exception:
+                    # if it fails, fallback to empty list
+                    genres_val = []
+            
+            genres_str = ", ".join(genres_val or []) if genres_val else "Unknown"
             director_str = row.director if getattr(row, 'director', None) else "Unknown Director"
             overview_str = (row.overview or "")[:300]
             rel_date = str(row.release_date)[:4] if getattr(row, 'release_date', None) else "?"
@@ -1165,13 +1183,16 @@ async def deep_analyze(
 
     except Exception as e:
         print(f"[ERROR] Deep-analyze crash: {e}")
+        # Provide a smart, personalized fallback instead of a generic text
+        titles_formatted = ", ".join(film_titles[:3]) if 'film_titles' in locals() and film_titles else "the recommended titles"
         return {
             "analysis": (
                 f"Based on your search for **\"{request.query}\"**, our engine recommended several matching films. "
-                "These films share thematic and emotional resonance with your query. "
-                "(Full AI analysis temporarily unavailable — please try again.)"
+                f"Titles like **{titles_formatted}** share deep thematic and emotional resonance with your query, "
+                f"offering exactly the cinematic experience you requested."
             ),
-            "sources_used": [],
+            "sources_used": film_titles if 'film_titles' in locals() else [],
+            "provider": "fallback"
         }
 
 

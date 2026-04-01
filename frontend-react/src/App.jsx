@@ -24,11 +24,52 @@ const PublicRoute = ({ children }) => {
   return user ? <Navigate to="/" replace /> : children;
 };
 
-function App() {
+const AppRoutes = () => {
+  const { user, authReady } = useAuth();
+  // Show intro only if they haven't seen it in local storage
   const [showIntro, setShowIntro] = useState(
     () => !localStorage.getItem('mirai_intro_seen')
   );
 
+  if (!authReady) return null;
+
+  // Crucial logic: Intro plays ONLY when user is logged in AND hasn't finished the intro.
+  // This ensures the login page is visible immediately.
+  const isPlayingIntro = user && showIntro;
+
+  return (
+    <>
+      {/* Cinematic intro — plays once when user successfully logs in */}
+      <AnimatePresence>
+        {isPlayingIntro && (
+          <CinematicIntro onComplete={() => setShowIntro(false)} />
+        )}
+      </AnimatePresence>
+
+      {/* Main routes — hidden while cinematic intro plays */}
+      {!isPlayingIntro && (
+        <div className="film-grain">
+          <Routes>
+            <Route
+              path="/login"
+              element={<PublicRoute><Login /></PublicRoute>}
+            />
+            <Route
+              path="/"
+              element={<ProtectedRoute><Layout /></ProtectedRoute>}
+            >
+              <Route index element={<Home />} />
+              <Route path="watchlist" element={<Watchlist />} />
+            </Route>
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </div>
+      )}
+    </>
+  );
+};
+
+function App() {
   return (
     <AuthProvider>
       <AppProvider>
@@ -48,33 +89,7 @@ function App() {
               error:   { iconTheme: { primary: '#dc2626', secondary: '#0a0e1a' } },
             }}
           />
-
-          {/* Cinematic intro — plays once on first visit */}
-          <AnimatePresence>
-            {showIntro && (
-              <CinematicIntro onComplete={() => setShowIntro(false)} />
-            )}
-          </AnimatePresence>
-
-          {/* Main routes — visible after intro or on subsequent visits */}
-          {!showIntro && (
-            <div className="film-grain">
-              <Routes>
-                <Route
-                  path="/login"
-                  element={<PublicRoute><Login /></PublicRoute>}
-                />
-                <Route
-                  path="/"
-                  element={<ProtectedRoute><Layout /></ProtectedRoute>}
-                >
-                  <Route index element={<Home />} />
-                  <Route path="watchlist" element={<Watchlist />} />
-                </Route>
-                <Route path="*" element={<Navigate to="/" replace />} />
-              </Routes>
-            </div>
-          )}
+          <AppRoutes />
         </BrowserRouter>
       </AppProvider>
     </AuthProvider>

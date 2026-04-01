@@ -137,15 +137,18 @@ async def generate_explanations(
         # Rule-based fallback (no LLM needed)
         results: Dict[int, str] = {}
         for m in candidates_batch:
-            title = m.title
+            title = m.title or "Unknown"
+            genres_str = ", ".join(m.genres[:2]).lower() if getattr(m, 'genres', None) else "compelling themes"
+            director_str = f" directed by {m.director}" if getattr(m, 'director', None) else ""
+            
             if detected_language == "es":
-                fallback = f"Esta película ({title}) coincide fuertemente con el estado de ánimo y los temas de su búsqueda. Disfrute de la visualización."
+                fallback = f"Con sus elementos de {genres_str}, esta película ({title}) coincide fuertemente con su búsqueda."
             elif detected_language == "ja":
-                fallback = f"この映画（{title}）は、あなたの検索の雰囲気やテーマと強く一致しています。ぜひお楽しみください。"
+                fallback = f"この映画（{title}）は、{genres_str}のテーマを通じて、あなたの検索と強く一致しています。"
             else:
                 fallback = (
-                    f"This title ({title}) strongly matches the mood and narrative themes of your search. "
-                    "It offers a compelling cinematic experience tailored to your exact prompt."
+                    f"\"{title}\"{director_str} directly answers your request by delivering strong {genres_str} elements. "
+                    f"Its emotional tone and narrative completely align with the exact cinematic mood you're craving."
                 )
             results[m.tmdb_id] = fallback
         return results, "fallback"

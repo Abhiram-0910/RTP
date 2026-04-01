@@ -5,4 +5,15 @@ __pycache__/
 *.db
 frontend-react/node_modules/
 frontend-react/dist/
-*_out.txt
+
+# Logs and development artifacts
+*.log
+err_trace.txt
+test_out*.txt
+query.json
+
+# IDE and System files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
