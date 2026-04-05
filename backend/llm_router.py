@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "deepseek-r1:8b"
 GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MAX_RETRIES = 3
+GEMINI_RETRY_DELAY = 1.0  # seconds
 
 
 class LLMRouter:
@@ -102,13 +104,28 @@ class LLMRouter:
                 max_output_tokens=max_tokens,
             ),
         )
-        try:
-            response = await model.generate_content_async(prompt)
-            return response.text
-        except Exception as e:
-            if "429" in str(e) or "quota" in str(e).lower():
-                raise Exception("gemini_rate_limit")
-            raise e
+
+        for attempt in range(GEMINI_MAX_RETRIES + 1):
+            try:
+                response = await model.generate_content_async(prompt)
+                return response.text
+            except Exception as e:
+                error_str = str(e).lower()
+                is_rate_limit = "429" in error_str or "quota" in error_str or "limit" in error_str
+                
+                if is_rate_limit and attempt < GEMINI_MAX_RETRIES:
+                    wait_time = GEMINI_RETRY_DELAY * (2 ** attempt)
+                    logger.warning(
+                        "Gemini rate limit hit (attempt %d/%d). Retrying in %.1fs...",
+                        attempt + 1, GEMINI_MAX_RETRIES, wait_time
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                # Final failure or non-retryable error
+                if is_rate_limit:
+                    raise Exception("gemini_rate_limit")
+                raise e
 
     async def _call_ollama(
         self,

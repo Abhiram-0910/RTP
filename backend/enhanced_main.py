@@ -596,7 +596,7 @@ def _calculate_diversity_score(recommendations: List[Dict[str, Any]]) -> float:
     return len(unique_genres) / len(all_genres)
 
 
-async def _cache_results(cache_key: str, response_data: Dict[str, Any]):
+def _cache_results(cache_key: str, response_data: Dict[str, Any]):
     """Caches recommendation results in the SQLite database."""
     db = SessionLocal()
     try:
@@ -614,7 +614,7 @@ async def _cache_results(cache_key: str, response_data: Dict[str, Any]):
         db.close()
 
 
-async def _log_analytics(request: UserQuery, num_results: int, detected_lang: str):
+def _log_analytics(request: UserQuery, num_results: int, detected_lang: str):
     db = SessionLocal()
     try:
         analytics_entry = SearchAnalytics(
@@ -1062,7 +1062,7 @@ def get_enhanced_recommendations(
             # Add to background tasks to return movies instantly
             background_tasks.add_task(
                 _generate_and_cache_explanation,
-                user_query.user_id, # Can use job_id but here we'll map multiple item IDs
+                job_id,
                 original_query,
                 top_5_media,
                 detected_lang
@@ -1830,60 +1830,56 @@ async def get_genre_cooccurrence():
 
 explanation_cache = {}
 
-async def _generate_and_cache_explanation(user_id, query, top_media, lang):
+def _generate_and_cache_explanation(job_id, query, top_media, lang):
     """Background task to generate explanations for media items and store them in the cache."""
     try:
         from backend.ai_explainer import generate_explanations
-        explanations_result, explanation_provider_used = await generate_explanations(
+        import asyncio
+        explanations_result, explanation_provider_used = asyncio.run(generate_explanations(
             query, top_media, lang
-        )
-        for tmdb_id, text in explanations_result.items():
-            data_to_cache = {
-                "explanation": text,
-                "provider": explanation_provider_used
-            }
-            # 1. Local Fallback Cache
-            explanation_cache[str(tmdb_id)] = data_to_cache
+        ))
+        
+        batch_data = {
+            "ready": True,
+            "explanations": explanations_result,
+            "provider": explanation_provider_used
+        }
 
-            # 2. Redis Distributed Cache (if available)
-            if REDIS_AVAILABLE and _redis_client:
-                try:
-                    _redis_client.setex(
-                        f"expl:{tmdb_id}",
-                        600, # 10-minute TTL
-                        json.dumps(data_to_cache)
-                    )
-                except Exception:
-                    pass
+        # 1. Local Fallback Cache (Size management to prevent memory leaks)
+        if len(explanation_cache) > 1000:
+            explanation_cache.clear()
+        explanation_cache[str(job_id)] = batch_data
+
+        # 2. Redis Distributed Cache (if available)
+        if REDIS_AVAILABLE and _redis_client:
+            try:
+                _redis_client.setex(
+                    f"expl:{job_id}",
+                    600, # 10-minute TTL
+                    json.dumps(batch_data)
+                )
+            except Exception:
+                pass
     except Exception as e:
         print(f"[BACKGROUND TASK] Explanation generation failed: {e}")
 
 @app.get("/api/explanation/{job_id}")
 async def get_explanation_by_job(job_id: str):
-    """Endpoint for the frontend to poll for explanation results by tmdb_id."""
+    """Endpoint for the frontend to poll for explanation results by job_id (UUID)."""
     # 1. Try Redis first (for multi-worker consistency)
     if REDIS_AVAILABLE and _redis_client:
         try:
             cached_json = _redis_client.get(f"expl:{job_id}")
             if cached_json:
-                cached_data = json.loads(cached_json)
-                return {
-                    "ready": True, 
-                    "explanation": cached_data["explanation"], 
-                    "provider": cached_data["provider"]
-                }
+                return json.loads(cached_json)
         except Exception:
             pass
 
     # 2. Fallback to local memory (only if not in Redis)
     if job_id in explanation_cache:
-        cached_data = explanation_cache[job_id]
-        return {
-            "ready": True, 
-            "explanation": cached_data["explanation"], 
-            "provider": cached_data["provider"]
-        }
-    return {"ready": False, "explanation": None}
+        return explanation_cache[job_id]
+        
+    return {"ready": False, "explanations": None}
 
 
 @app.get("/api/because-you-watched/{tmdb_id}")
