@@ -39,13 +39,20 @@ class LLMRouter:
         self.gemini_cooldown_until: float = 0.0   # epoch seconds
         self.gemini_cooldown_duration: int = 60   # seconds to wait after rate limit hit
         self._ollama_available: Optional[bool] = None  # None = not yet checked
+        self._ollama_last_check: float = 0.0
 
     # ── Ollama availability probe ──────────────────────────────────────────────
 
     async def _check_ollama(self) -> bool:
-        """Check if Ollama is running and deepseek-r1:8b is available."""
+        """Check if Ollama is running. Retries every 5 minutes after a failure."""
+        import time
+        now = time.time()
+        # If we have a cached result less than 5 minutes old, return it
         if self._ollama_available is not None:
-            return self._ollama_available
+            last_check = getattr(self, '_ollama_last_check', 0)
+            if self._ollama_available or (now - last_check) < 300:
+                return self._ollama_available
+        self._ollama_last_check = now
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -60,8 +67,7 @@ class LLMRouter:
                             logger.info("Ollama fallback: deepseek-r1:8b is available")
                         else:
                             logger.warning(
-                                "Ollama running but deepseek-r1:8b not found. "
-                                "Available: %s", models
+                                "Ollama running but deepseek-r1:8b not found. Available: %s", models
                             )
                         return self._ollama_available
         except Exception as exc:

@@ -36,13 +36,13 @@ python backend/tmdb_data_collector.py
 **Step 6: Start the backend server**
 Launch the FastAPI uvicorn engine locally.
 ```bash
-uvicorn backend.main:app --reload --port 8000
+uvicorn backend.enhanced_main:app --reload --port 8000
 ```
 
 **Step 7: Set up the frontend client**
 In a new terminal window, navigate to the frontend directory, install dependencies, and start the Vite dev server:
 ```bash
-cd frontend
+cd frontend-react
 npm install
 npm run dev
 ```

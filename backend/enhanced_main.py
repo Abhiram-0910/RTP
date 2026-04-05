@@ -543,16 +543,13 @@ def _fallback_database_search(query: str, db: Session, limit: int = 10) -> List[
             or_(
                 func.lower(Media.title).like(search_query),
                 func.lower(Media.overview).like(search_query),
-                func.lower(Media.genres_str).like(search_query),
-                func.lower(Media.keywords_str).like(search_query),
             )
         )
         .order_by(Media.popularity_score.desc())
         .limit(limit)
         .all()
     )
-    # Return in a format similar to FAISS output (doc, score)
-    return [(r, 0.5) for r in results]  # Assign a dummy score
+    return [(r, 0.5) for r in results]
 
 
 def _fetch_tmdb_providers(tmdb_id: int, media_type: str) -> List[str]:
@@ -841,15 +838,14 @@ async def get_enhanced_recommendations(
         # 1. Map Original Language
         if is_lang_filter:
             LANGUAGE_MAP = {
-                "telugu": "te", "hindi": "hi", "tamil": "ta", 
-                "malayalam": "ml", "kannada": "kn", "english": "en", 
+                "telugu": "te", "hindi": "hi", "tamil": "ta",
+                "malayalam": "ml", "kannada": "kn", "english": "en",
                 "spanish": "es", "korean": "ko", "japanese": "ja", "french": "fr"
             }
-            ui_lang = user_query.language_filter.lower()
-            db_lang = LANGUAGE_MAP.get(ui_lang, ui_lang)
-            if "filter" not in search_kwargs:
-                search_kwargs["filter"] = {}
-            search_kwargs["filter"]["original_language"] = db_lang
+            # Note: FAISS does not support metadata filters natively.
+            # Language filtering is applied post-retrieval via _passes_advanced_filters.
+            # We already set _search_k = 1200 above to compensate for the filtering loss.
+            pass  # filter applied post-retrieval only
 
         # 2. Map Media Type
         MEDIA_MAP = {
@@ -1241,23 +1237,7 @@ async def deep_analyze(
 
 # ── AI Explanation Polling Endpoint ───────────────────────────────────────────
 
-@app.get("/api/explanation/{tmdb_id}")
-async def get_explanation(tmdb_id: int, lang: str = Query("en")):
-    """
-    Polling endpoint for decoupled background AI explanation generation.
-    Retrieves the generated rationale directly from Redis.
-    """
-    if not REDIS_AVAILABLE or not _redis_client:
-        return {"tmdb_id": tmdb_id, "explanation": "Redis cache unavailable. Wait for real refresh.", "ready": True}
 
-    try:
-        cached_exp = _redis_client.get(f"explanation:{tmdb_id}:{lang}")
-        if cached_exp:
-            return {"tmdb_id": tmdb_id, "explanation": cached_exp.decode('utf-8'), "ready": True}
-        return {"tmdb_id": tmdb_id, "explanation": None, "ready": False}
-    except Exception as e:
-        logger.error(f"Error polling explanation: {e}")
-        return {"tmdb_id": tmdb_id, "explanation": "Failed to look up explanation status.", "ready": True}
 
 
 # ── Benchmark Endpoint ────────────────────────────────────────────────────────
@@ -1811,7 +1791,7 @@ async def _generate_and_cache_explanation(user_id, query, top_media, lang):
         print(f"[BACKGROUND TASK] Explanation generation failed: {e}")
 
 @app.get("/api/explanation/{job_id}")
-async def get_explanation(job_id: str):
+async def get_explanation_by_job(job_id: str):
     """Endpoint for the frontend to poll for explanation results by tmdb_id."""
     if job_id in explanation_cache:
         cached_data = explanation_cache[job_id]

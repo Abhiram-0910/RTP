@@ -28,6 +28,16 @@ class MiraiExplainer:
             logger.warning(f"[MiraiExplainer] Search explanation failed: {e}")
             return f"Personalised for you based on '{query}' and thematic cinematic markers."
 
+    def generate_trending_explanation(self, trending_movies: list, trending_shows: list) -> str:
+        """Generate a brief explanation for the trending content section."""
+        movie_titles = [m.get("title", "") for m in (trending_movies or [])[:3] if m.get("title")]
+        show_titles = [s.get("title", "") for s in (trending_shows or [])[:2] if s.get("title")]
+        all_titles = movie_titles + show_titles
+        if not all_titles:
+            return "Check out what's trending right now!"
+        titles_str = ", ".join(all_titles[:4])
+        return f"Trending this week: {titles_str} and more — curated by MIRAI."
+
     async def async_generate_explanation(self, query: str, results: List[Media]) -> Tuple[str, str]:
         from .llm_router import llm_router
         titles = [m.title for m in results[:5]]

@@ -9,6 +9,9 @@ import asyncio
 import requests
 import google.generativeai as genai
 from typing import Callable, Any, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Database imports — pgvector search uses SQLAlchemy directly
 from backend.enhanced_database import SessionLocal, EnhancedInteraction
@@ -238,6 +241,23 @@ class RecommendationEngine:
                 f"{self.embedding_dim}-dim vectors, stored index expects {self.index_dim}-dim. "
                 f"Vectors will be projected (zero-padded or truncated) automatically."
             )
+
+    @property
+    def embeddings(self):
+        if self._embeddings is not None:
+            return self._embeddings
+        # Lazy-load HuggingFace embeddings as fallback
+        try:
+            from langchain_huggingface import HuggingFaceEmbeddings
+            self._embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                model_kwargs={"device": "cpu"},
+            )
+            self.embedding_dim = 384
+        except Exception as exc:
+            print(f"[RecommendationEngine] Could not load HuggingFace embeddings: {exc}")
+            return None
+        return self._embeddings
 
     # ── Embedding Utilities ────────────────────────────────────────────────────
 
@@ -788,7 +808,7 @@ class RecommendationEngine:
 
         candidates = []
         for media_db_id, score in hits:
-            media_record = db.query(Media).filter(Media.id == media_db_id).first()
+            media_record = db.query(Media).filter(Media.db_id == media_db_id).first()
             if not media_record:
                 continue
 
@@ -813,7 +833,7 @@ class RecommendationEngine:
 
             candidates.append({
                 "id":              tmdb_id,
-                "db_id":           int(media_record.id),
+                "db_id":           int(media_record.db_id),
                 "title":           media_record.title,
                 "overview":        media_record.overview,
                 "release_date":    media_record.release_date,
