@@ -503,10 +503,10 @@ async def main() -> None:
     # as a standalone script vs. as part of the FastAPI app.
     global MediaTable  # noqa: PLW0603
     try:
-        from backend.models import Media  # FastAPI app context
+        from backend.enhanced_database import Media  # FastAPI app context
         MediaTable = Media.__table__
     except ImportError:
-        from backend.models import Media  # standalone execution
+        from backend.enhanced_database import Media  # standalone execution
         MediaTable = Media.__table__
 
     # ------------------------------------------------------------------
@@ -749,10 +749,10 @@ async def main() -> None:
     # as a standalone script vs. as part of the FastAPI app.
     global MediaTable  # noqa: PLW0603
     try:
-        from backend.models import Media  # FastAPI app context
+        from backend.enhanced_database import Media  # FastAPI app context
         MediaTable = Media.__table__
     except ImportError:
-        from backend.models import Media  # standalone execution
+        from backend.enhanced_database import Media  # standalone execution
         MediaTable = Media.__table__
 
     # ------------------------------------------------------------------

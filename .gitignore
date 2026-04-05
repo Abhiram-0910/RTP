@@ -17,3 +17,11 @@ query.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Data and Logs
+data/
+*.txt
+*.log
+debug_*.py
+*.bat
+*.sh

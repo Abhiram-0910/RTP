@@ -4,7 +4,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 from .config import settings
-from .models import Media
+from .enhanced_database import Media
 
 logger = logging.getLogger(__name__)
 

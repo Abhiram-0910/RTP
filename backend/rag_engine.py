@@ -12,7 +12,7 @@ from typing import Callable, Any, Optional
 
 # Database imports — pgvector search uses SQLAlchemy directly
 from backend.enhanced_database import SessionLocal, EnhancedInteraction
-from backend.models import Media
+from backend.enhanced_database import Media
 from sqlalchemy import text as sa_text
 from sklearn.feature_extraction.text import TfidfVectorizer
 

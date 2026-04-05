@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "deepseek-r1:8b"
-GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-2.0-flash"
 
 
 class LLMRouter:

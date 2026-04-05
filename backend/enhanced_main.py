@@ -81,7 +81,7 @@ except ImportError:
 from backend.enhanced_database import (
     get_db, User, Media, StreamingPlatform, EnhancedInteraction,
     UserReview, RecommendationCache, TrendingMedia, SearchAnalytics,
-    init_enhanced_db, WatchProgress
+    init_enhanced_db, WatchProgress, SessionLocal
 )
 from backend.ai_explainer import get_ai_explainer
 from backend.advanced_recommendation_engine import AdvancedRecommendationEngine
@@ -512,10 +512,17 @@ def _passes_advanced_filters(media: Media, request: UserQuery) -> bool:
             return False
     if request.max_runtime and media.runtime and media.runtime > request.max_runtime:
         return False
-    # FIX Issue 2: Language content filter
+    # FIX: Language filter — translate UI string to ISO code before comparing
     if request.language_filter and request.language_filter.lower() not in ("all", "", "none"):
+        LANGUAGE_MAP = {
+            "telugu": "te", "hindi": "hi", "tamil": "ta",
+            "malayalam": "ml", "kannada": "kn", "english": "en",
+            "spanish": "es", "korean": "ko", "japanese": "ja", "french": "fr"
+        }
+        ui_lang = request.language_filter.lower()
+        iso_lang = LANGUAGE_MAP.get(ui_lang, ui_lang)  # e.g. 'telugu' -> 'te'
         media_lang = (media.original_language or "en").lower()
-        if media_lang != request.language_filter.lower():
+        if media_lang != iso_lang:
             return False
     return True
 
@@ -585,7 +592,7 @@ def _calculate_diversity_score(recommendations: List[Dict[str, Any]]) -> float:
 
 async def _cache_results(cache_key: str, response_data: Dict[str, Any]):
     """Caches recommendation results in the SQLite database."""
-    db = next(get_db_session())  # Get a new session for background task
+    db = SessionLocal()
     try:
         cache_entry = RecommendationCache(
             cache_key=cache_key,
@@ -603,7 +610,7 @@ async def _cache_results(cache_key: str, response_data: Dict[str, Any]):
 
 async def _log_analytics(request: UserQuery, num_results: int, detected_lang: str):
     """Logs search analytics to the database."""
-    db = next(get_db_session())
+    db = SessionLocal()
     try:
         analytics_entry = SearchAnalytics(
             user_id=request.user_id,
@@ -826,18 +833,47 @@ async def get_enhanced_recommendations(
             
         from backend.rag_chain import rag_chain_instance
         docs_with_scores = []
-        if rag_chain_instance.vector_store:
-            docs_with_scores = rag_chain_instance.vector_store.similarity_search_with_score(
-                translated_query, k=_search_k
+
+        search_kwargs = {"k": _search_k}
+        
+        # 1. Map Original Language
+        if is_lang_filter:
+            LANGUAGE_MAP = {
+                "telugu": "te", "hindi": "hi", "tamil": "ta", 
+                "malayalam": "ml", "kannada": "kn", "english": "en", 
+                "spanish": "es", "korean": "ko", "japanese": "ja", "french": "fr"
+            }
+            ui_lang = user_query.language_filter.lower()
+            db_lang = LANGUAGE_MAP.get(ui_lang, ui_lang)
+            if "filter" not in search_kwargs:
+                search_kwargs["filter"] = {}
+            search_kwargs["filter"]["original_language"] = db_lang
+
+        # 2. Map Media Type
+        MEDIA_MAP = {
+            "movies": "movie",
+            "movie": "movie",
+            "tv": "tv",
+            "shows": "tv"
+        }
+        if user_query.media_type and user_query.media_type.lower() != "all":
+            ui_type = user_query.media_type.lower()
+            db_type = MEDIA_MAP.get(ui_type, ui_type)
+            if "filter" not in search_kwargs:
+                search_kwargs["filter"] = {}
+            search_kwargs["filter"]["media_type"] = db_type
+
+        print(f"Executing FAISS search with kwargs: {search_kwargs}")
+
+        # CRITICAL FIX: Use the disk-loaded vector_store (which has correct metadata)
+        # NOT rag_chain_instance.vector_store (which is built from DB records without metadata)
+        if vector_store:
+            docs_with_scores = vector_store.similarity_search_with_score(
+                translated_query, **search_kwargs
             )
         else:
-            # Fallback to local FAISS global variable if rag_chain not ready
-            if vector_store:
-                docs_with_scores = vector_store.similarity_search_with_score(
-                    translated_query, k=60
-                )
-            else:
-                docs_with_scores = _fallback_database_search(translated_query, db, limit=60)
+            # True last resort — plain text DB search with no vector math
+            docs_with_scores = _fallback_database_search(translated_query, db, limit=_search_k)
 
         # ── Step 4: Build candidate list with Batch DB Lookup & Deduplication ──
         tmdb_id_to_best_score = {}
@@ -1039,34 +1075,11 @@ async def get_enhanced_recommendations(
                 cache_hit=False
             )
         else:
-            # Fallback: return top popular titles
-            fallback_media = (
-                db.query(Media)
-                .order_by(Media.popularity_score.desc())
-                .limit(8)
-                .all()
-            )
+            # Removed silent fallback — returning clean empty list for accurate UI filtering feedback
             final_results = []
-            for m in fallback_media:
-                final_results.append({
-                    "id": int(m.tmdb_id),
-                    "title": m.title,
-                    "overview": m.overview or "",
-                    "release_date": m.release_date or "",
-                    "rating": float(m.rating or 0),
-                    "poster_path": _format_poster_url(m.poster_path),
-                    "media_type": m.media_type,
-                    "genres": m.genres or [],
-                    "keywords": m.keywords or [],
-                    "match_score": 0,
-                    "streaming_platforms": [p.name for p in m.platforms],
-                    "explanation": "Popular choice!",
-                    "similarity_factors": compute_similarity_factors(m, original_query, 0.0)
-                })
-
             response_data = {
                 "explanation": (
-                    "No semantic matches found — here are our most popular recommendations!"
+                    "No matches found using the applied filters. Try adjusting your preferences!"
                 ),
                 "movies": final_results,
                 "query": original_query,
@@ -1904,7 +1917,7 @@ async def get_platform_stats(db: Session = Depends(get_db)):
     """Counts the occurrences of each platform listed across all media."""
     try:
         from collections import Counter
-        from backend.models import StreamingPlatform
+        from backend.enhanced_database import StreamingPlatform
         # Query total streams directly from the StreamingPlatform table 
         # which maps many-to-one or many-to-many to Media
         platforms = db.query(StreamingPlatform).all()

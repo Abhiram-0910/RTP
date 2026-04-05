@@ -5,7 +5,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
   Search, Star, Heart, ThumbsDown, BookmarkPlus,
-  Tv, Film, Globe, Layers, Sparkles, AlertCircle, X, Camera, Play
+  Tv, Film, Globe, Layers, Sparkles, AlertCircle, X, Camera, Play,
+  SlidersHorizontal, ChevronUp, ChevronDown, Loader2
 } from 'lucide-react';
 import { getRecommendations, rateTitle, manageWatchlist } from '../services/api';
 import { useAuth } from '../context/AuthContext';
