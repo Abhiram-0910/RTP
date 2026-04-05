@@ -43,7 +43,10 @@ const AppRoutes = () => {
       {/* Cinematic intro — plays once when user successfully logs in */}
       <AnimatePresence>
         {isPlayingIntro && (
-          <CinematicIntro onComplete={() => setShowIntro(false)} />
+          <CinematicIntro onComplete={() => {
+            setShowIntro(false);
+            localStorage.setItem('mirai_intro_seen', 'true');
+          }} />
         )}
       </AnimatePresence>
 

@@ -609,18 +609,20 @@ async def _cache_results(cache_key: str, response_data: Dict[str, Any]):
 
 
 async def _log_analytics(request: UserQuery, num_results: int, detected_lang: str):
-    """Logs search analytics to the database."""
     db = SessionLocal()
     try:
         analytics_entry = SearchAnalytics(
             user_id=request.user_id,
             query=request.query,
-            detected_language=detected_lang,
-            num_results=num_results,
-            genre_filter=request.genre,
-            media_type_filter=request.media_type,
-            min_rating_filter=request.min_rating,
-            platforms_filter=request.platforms,
+            query_language=detected_lang,
+            results_count=num_results,
+            filters_used={
+                "genre": request.genre,
+                "media_type": request.media_type,
+                "min_rating": request.min_rating,
+                "platforms": request.platforms,
+                "language_filter": request.language_filter,
+            },
         )
         db.add(analytics_entry)
         db.commit()
@@ -1537,168 +1539,6 @@ async def mark_watched(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Mark-watched error: {str(e)}")
 
-
-# ── Admin Routes ──────────────────────────────────────────────────────────────
-
-class ManageSourceRequest(BaseModel):
-    source_type: str   # "csv" | "url"
-    source: str        # file path or URL
-    media_type: str = "movie"  # "movie" | "tv"
-
-
-@app.post("/api/admin/update_db")
-async def admin_update_db(
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    admin: dict = Depends(require_admin),
-):
-    """Admin: trigger a TMDB trending refresh (updates TrendingMedia table)."""
-    try:
-        if TASKS_AVAILABLE:
-            background_tasks.add_task(dispatch_refresh_trending)
-            return {"status": "queued", "message": "Trending refresh dispatched (Celery or background thread)."}
-        else:
-            # Inline synchronous refresh
-            from backend.tasks import _do_refresh_trending
-            background_tasks.add_task(_do_refresh_trending)
-            return {"status": "queued", "message": "Trending refresh dispatched as background task."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Admin update_db error: {str(e)}")
-
-
-@app.post("/api/admin/manage_sources")
-async def admin_manage_sources(
-    request: ManageSourceRequest,
-    background_tasks: BackgroundTasks,
-    admin: dict = Depends(require_admin),
-):
-    """
-    Admin: register a new CSV or URL data source for ingestion.
-    Queues a background ingest task.
-    """
-    import pathlib
-
-    if request.source_type == "csv":
-        p = pathlib.Path(request.source)
-        if not p.exists():
-            raise HTTPException(status_code=400, detail=f"CSV file not found: {request.source}")
-        if p.suffix.lower() != ".csv":
-            raise HTTPException(status_code=400, detail="source must be a .csv file.")
-        source_abs = str(p.resolve())
-    elif request.source_type == "url":
-        if not request.source.startswith(("http://", "https://")):
-            raise HTTPException(status_code=400, detail="source must be a valid http/https URL.")
-        source_abs = request.source
-    else:
-        raise HTTPException(status_code=400, detail="source_type must be 'csv' or 'url'.")
-
-    def _run_ingest(source: str, source_type: str, media_type: str):
-        """Background ingest task."""
-        try:
-            import sys, os
-            sys.path.insert(0, os.path.dirname(__file__))
-            if source_type == "csv":
-                import pandas as pd
-                from backend.enhanced_database import get_db_session, Media
-                df = pd.read_csv(source, dtype=str).fillna("")
-                db2 = get_db_session()
-                added = 0
-                for _, row in df.iterrows():
-                    tmdb_id = row.get("id") or row.get("tmdb_id", "")
-                    if not tmdb_id:
-                        continue
-                    exists = db2.query(Media).filter(Media.tmdb_id == int(tmdb_id)).first()
-                    if exists:
-                        continue
-                    db2.add(Media(
-                        tmdb_id=int(tmdb_id),
-                        title=row.get("title", "Unknown"),
-                        overview=row.get("overview", ""),
-                        release_date=row.get("release_date", ""),
-                        rating=float(row.get("vote_average") or 0),
-                        poster_path=row.get("poster_path", ""),
-                        media_type=media_type,
-                    ))
-                    added += 1
-                db2.commit()
-                db2.close()
-                print(f"[admin/manage_sources] Ingested {added} new titles from {source}")
-            elif source_type == "url":
-                print(f"[admin/manage_sources] URL ingestion queued for: {source} (implement custom scraper)")
-        except Exception as e:
-            print(f"[admin/manage_sources] Ingest error: {e}")
-
-    background_tasks.add_task(_run_ingest, source_abs, request.source_type, request.media_type)
-    return {
-        "status": "queued",
-        "message": f"Ingest of '{source_abs}' (type={request.source_type}) dispatched.",
-        "source_type": request.source_type,
-        "media_type": request.media_type,
-    }
-
-
-# ── User Stats Endpoint ───────────────────────────────────────────────────────
-
-@app.get("/api/user_stats/{user_id}")
-async def get_user_stats(user_id: str, db: Session = Depends(get_db)):
-    try:
-        interactions = (
-            db.query(EnhancedInteraction)
-            .filter(EnhancedInteraction.user_id == user_id)
-            .all()
-            .all()
-        )
-        return {
-            "recent_searches": [
-                {
-                    "query": s.query,
-                    "language": s.query_language,
-                    "results": s.results_count,
-                    "timestamp": s.timestamp.isoformat(),
-                }
-                for s in recent
-            ]
-        }
-    except Exception as e:
-        return {"recent_searches": []}
-
-
-# Helper functions have been deduplicated to the top of the file
-
-# ── Bonus Verification Endpoints ──────────────────────────────────────────────
-
-@app.get("/api/similar/{tmdb_id}")
-async def get_similar_titles(tmdb_id: int, db: Session = Depends(get_db)):
-    """Finds similar titles via local FAISS index (fallback from pgvector)."""
-    from backend.rag_chain import rag_chain_instance
-    # 1. Lookup item in DB to get title/overview for vector search
-    item = db.query(Media).filter(Media.tmdb_id == tmdb_id).first()
-    if not item:
-        raise HTTPException(404, "Item not found")
-        
-    if not rag_chain_instance.vector_store:
-        raise HTTPException(503, "Vector store not initialized")
-
-    query_str = f"{item.title}: {item.overview}"
-    similar_docs = rag_chain_instance.vector_store.similarity_search(query_str, k=9)
-
-    similar_results = []
-    for doc in similar_docs:
-        sid = doc.metadata.get("tmdb_id")
-        if sid == tmdb_id:
-            continue
-        m = db.query(Media).filter(Media.tmdb_id == sid).first()
-        if m:
-            similar_results.append({
-                "id": int(m.db_id),
-                "title": m.title,
-                "poster_path": _format_poster_url(m.poster_path),
-                "rating": float(m.rating or 0.0),
-                "media_type": m.media_type,
-                "release_year": m.release_date.split("-")[0] if m.release_date else None,
-                "genres": m.genres or []
-            })
-    return similar_results[:8]
 
 # ── Admin Routes ──────────────────────────────────────────────────────────────
 

@@ -231,9 +231,8 @@ def update_trending_and_providers(self) -> dict[str, Any]:
                     )
                     if record is None:
                         continue
-                    record.popularity      = float(item.get("popularity", record.popularity or 0))
-                    record.trending_rank   = rank
-                    record.trending_updated_at = datetime.now(timezone.utc)
+                    record.popularity_score = float(item.get("popularity", record.popularity_score or 0))
+                    record.last_updated = datetime.now(timezone.utc)
                     stats["trending_updated"] += 1
                 except Exception as db_exc:
                     logger.warning("DB update failed for tmdb_id=%s: %s", tmdb_id, db_exc)
@@ -258,8 +257,8 @@ def update_trending_and_providers(self) -> dict[str, Any]:
     try:
         top_titles = (
             db.query(Media)
-            .filter(Media.popularity.isnot(None))
-            .order_by(Media.popularity.desc())
+            .filter(Media.popularity_score.isnot(None))
+            .order_by(Media.popularity_score.desc())
             .limit(_TOP_N_TITLES)
             .all()
         )

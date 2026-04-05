@@ -9,7 +9,7 @@ can be constructed directly from SQLAlchemy ORM instances via
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -143,12 +143,7 @@ class SearchRequest(BaseModel):
         description='Optionally restrict to "movie" or "tv" content',
     )
 
-class DeepAnalyzeRequest(BaseModel):
-    query: str = Field(..., description="The original user search query")
-    candidate_tmdb_ids: List[int] = Field(..., description="Top result TMDB IDs for context")
-
     @field_validator("country_code", check_fields=False)
-
     @classmethod
     def uppercase_country(cls, v: Optional[str]) -> Optional[str]:
         return v.upper() if v else v
@@ -157,6 +152,11 @@ class DeepAnalyzeRequest(BaseModel):
     @classmethod
     def lowercase_language(cls, v: Optional[str]) -> Optional[str]:
         return v.lower() if v else v
+
+
+class DeepAnalyzeRequest(BaseModel):
+    query: str = Field(..., description="The original user search query")
+    candidate_tmdb_ids: List[int] = Field(..., description="Top result TMDB IDs for context")
 
 
 class RecommendationItem(BaseModel):
