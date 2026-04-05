@@ -69,5 +69,15 @@ class Settings(BaseSettings):
     CACHE_MAX_SIZE: int = 512
     CACHE_TTL_SECONDS: int = 3600  # 1 hour
 
+    # ------------------------------------------------------------------
+    # Security (FAISS Integrity)
+    # ------------------------------------------------------------------
+    FAISS_INDEX_HASH: str | None = Field(
+        None, description="Expected SHA-256 hash for index.faiss"
+    )
+    FAISS_PKL_HASH: str | None = Field(
+        None, description="Expected SHA-256 hash for index.pkl"
+    )
+
 
 settings = Settings()  # type: ignore[call-arg]

@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { useAuth } from '../context/AuthContext';
 import { Bookmark, LogOut, User, Menu, X, Compass, Sparkles, BarChart2 } from 'lucide-react';
 import MiraiLogo from './MiraiLogo';
+import LanguageSelector from './LanguageSelector';
 
 const Layout = () => {
   const { user, logout } = useAuth();
@@ -66,6 +67,7 @@ const Layout = () => {
 
           {/* User + logout */}
           <div className="hidden sm:flex items-center gap-4">
+            <LanguageSelector />
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/5">
               <div className="w-6 h-6 rounded-full bg-gradient-to-br from-accent to-cinema-violet flex items-center justify-center">
                 <User size={12} className="text-white" />
@@ -110,12 +112,19 @@ const Layout = () => {
                   <BarChart2 size={14} /> Taste Profile
                 </NavLink>
                 <div className="pt-3 border-t border-white/5 mt-2 flex items-center justify-between">
-                  <span className="text-slate-400 text-sm flex items-center gap-2">
-                    <User size={14} />{user?.username}
-                  </span>
-                  <button onClick={handleLogout} className="text-sm text-red-400 flex items-center gap-1.5">
-                    <LogOut size={14} /> Sign out
-                  </button>
+                  <div className="flex flex-col gap-3 w-full">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400 text-sm flex items-center gap-2">
+                        <User size={14} />{user?.username}
+                      </span>
+                      <button onClick={handleLogout} className="text-sm text-red-400 flex items-center gap-1.5">
+                        <LogOut size={14} /> Sign out
+                      </button>
+                    </div>
+                    <div className="flex justify-start">
+                      <LanguageSelector />
+                    </div>
+                  </div>
                 </div>
               </div>
             </motion.div>

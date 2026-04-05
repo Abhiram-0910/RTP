@@ -16,23 +16,29 @@ async def test_health():
 @pytest.mark.asyncio
 async def test_search_valid():
     """
-    Validates native cross-linguistic execution and RAG generation limits on specific queries.
+    Validates cross-linguistic search with the production /api/recommend endpoint.
     """
+    payload = {
+        "query": "romantic comedy with emotional depth",
+        "user_id": "test_user",
+        "media_type": "movie",
+        "language_preference": "en"
+    }
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        response = await ac.post("/api/search", json={"query": "romantic comedy with emotional depth"})
+        response = await ac.post("/api/recommend", json=payload)
         
     assert response.status_code == 200
     data = response.json()
-    assert "results" in data
-    assert isinstance(data["results"], list)
+    assert "movies" in data
+    assert isinstance(data["movies"], list)
 
 @pytest.mark.asyncio
 async def test_search_empty():
     """
-    Validates strict boundary errors upon empty payload ingestion correctly.
+    Validates boundary error enforcement on empty queries.
     """
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
-        response = await ac.post("/api/search", json={"query": ""})
+        response = await ac.post("/api/recommend", json={"query": ""})
         
     assert response.status_code == 400
     assert "Query cannot be empty" in response.json()["detail"]
@@ -40,10 +46,14 @@ async def test_search_empty():
 @pytest.mark.asyncio
 async def test_trending():
     """
-    Validates globally cached media arrays sequentially.
+    Validates trending media aggregation and explanation generation structure.
     """
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         response = await ac.get("/api/trending")
         
     assert response.status_code == 200
-    assert isinstance(response.json(), list)
+    data = response.json()
+    assert isinstance(data, dict)
+    assert "trending" in data
+    assert "explanation" in data
+    assert isinstance(data["trending"], list)

@@ -5,7 +5,7 @@
  * This context only holds userId (derived from the logged-in user)
  * and language preference.
  */
-import React, { createContext, useContext } from 'react';
+import React, { createContext, useContext, useState, useEffect } from 'react';
 import { useAuth } from './AuthContext';
 
 const AppContext = createContext();
@@ -13,12 +13,21 @@ const AppContext = createContext();
 export const AppProvider = ({ children }) => {
   const { user } = useAuth();
 
-  // userId comes from the authenticated user; falls back to 'guest'
+  // Basic userId logic (synced with AuthContext)
   const userId = user?.username ?? 'guest';
-  const language = 'en';
+
+  // State-driven language preference (persists in localStorage)
+  const [language, setLanguage] = useState(() => {
+    return localStorage.getItem('mirai_language') || 'en';
+  });
+
+  // Sync state changes to localStorage
+  useEffect(() => {
+    localStorage.setItem('mirai_language', language);
+  }, [language]);
 
   return (
-    <AppContext.Provider value={{ userId, language }}>
+    <AppContext.Provider value={{ userId, language, setLanguage }}>
       {children}
     </AppContext.Provider>
   );

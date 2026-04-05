@@ -26,6 +26,11 @@ from backend.platform_normalizer import normalize as _norm_provider, normalize_l
 from backend.justwatch_client import get_justwatch_client
 from backend.faiss_fallback import FAISSFallback
 
+
+class DimensionMismatchError(Exception):
+    """Custom exception for embedding dimension mismatches."""
+    pass
+
 # ── FAISSFallback module-level singleton ───────────────────────────────────────
 # Loaded once at startup (or lazily on first search call) and kept for the
 # lifetime of the process. Thread-safe for reads; population is idempotent.
@@ -219,16 +224,22 @@ class RecommendationEngine:
         else:
             # Load FAISS as the primary search backend
             try:
-                self.vector_store = FAISS.load_local(
-                    "../data/faiss_index",
-                    self.embeddings,
-                    allow_dangerous_deserialization=True,
-                )
-                self.index_dim = self._probe_faiss_dim()
-                print(
-                    f"[RecommendationEngine] Using FAISS (stored dim={self.index_dim}, "
-                    f"active model dim={self.embedding_dim})."
-                )
+                from backend.security import verify_faiss_integrity
+                faiss_path = os.path.join(os.path.dirname(__file__), "..", "data", "faiss_index")
+                if verify_faiss_integrity(faiss_path):
+                    self.vector_store = FAISS.load_local(
+                        faiss_path,
+                        self.embeddings,
+                        allow_dangerous_deserialization=True,
+                    )
+                    self.index_dim = self._probe_faiss_dim()
+                    print(
+                        f"[RecommendationEngine] Using FAISS (stored dim={self.index_dim}, "
+                        f"active model dim={self.embedding_dim})."
+                    )
+                else:
+                    print(f"[SECURITY ALERT] FAISS index integrity check FAILED for {faiss_path}. Aborting load.")
+                    self.vector_store = None
             except Exception as e:
                 print(f"[WARNING] Could not load FAISS index: {e}")
                 print("[WARNING] Falling back to TF-IDF keyword search for all queries.")
@@ -288,32 +299,16 @@ class RecommendationEngine:
 
     def _safe_embed(self, text: str) -> list:
         """
-        Embed *text* with the active model, then project the vector to match
-        ``self.index_dim`` if the dimensions differ.
-
-        Projection strategy
-        -------------------
-        * active < stored  → zero-pad on the right  (e.g. 384 → 768)
-        * active > stored  → truncate on the right  (e.g. 768 → 384)
-        * equal            → return as-is
-
-        Zero-padding is information-preserving: the 384 directions that the
-        model learned are kept intact; the extra 384 slots are zero, which
-        means they do not contribute to the cosine similarity calculation.
-        This is far better than crashing.
+        Embed *text* with the active model and verify it matches the index dimensions.
+        Strictly enforces equality to prevent invalid cosine similarity results.
         """
         vec = self.embeddings.embed_query(text)
 
         target = self.index_dim
-        if target is None or len(vec) == target:
-            return vec  # no adjustment needed
-
-        if len(vec) < target:
-            # Zero-pad to reach the target dimension
-            vec = vec + [0.0] * (target - len(vec))
-        else:
-            # Truncate to the target dimension
-            vec = vec[:target]
+        if target is not None and len(vec) != target:
+            msg = f"Embedding dimension mismatch: expected {target}, got {len(vec)}."
+            logger.critical(f"CRITICAL: {msg} Vector search is mathematically invalid.")
+            raise DimensionMismatchError(msg)
 
         return vec
 
@@ -534,20 +529,7 @@ class RecommendationEngine:
                 if tmdb_flatrate_count < 2 and title:
                     try:
                         jw_client = get_justwatch_client()
-                        try:
-                            # Safely handle existing event loop Context
-                            loop = asyncio.get_running_loop()
-                            jw_platforms = []
-                            # It's better to refactor, but for a quick fix without breaking signature
-                            # we can skip JustWatch in sync context if there's no safe way, 
-                            # or just use an executor. But let's assume it can be left blank or fallback.
-                        except RuntimeError:
-                            # Not inside a running loop, so new loop is safe
-                            loop = asyncio.new_event_loop()
-                            jw_platforms = loop.run_until_complete(
-                                jw_client.get_platforms(title, year=year)
-                            )
-                            loop.close()
+                        jw_platforms = jw_client.get_platforms(title, year=year)
                     except Exception:
                         jw_platforms = []
 
@@ -976,6 +958,15 @@ class RecommendationEngine:
                 candidates = self._raw_faiss_fallback_search(
                     query, db, top_k, media_type, min_rating, user_likes, user_dislikes
                 )
+        except DimensionMismatchError as dim_err:
+            print(f"[RecommendationEngine] {dim_err}. Bypassing vector search entirely.")
+            try:
+                candidates = self._tfidf_search(
+                    query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
+                )
+            except Exception as tfidf_err:
+                print(f"[RecommendationEngine] TF-IDF fallback also failed: {tfidf_err}")
+                candidates = []
         except Exception as vector_err:
             print(
                 f"[RecommendationEngine] Primary/secondary vector search failed ({vector_err}). "

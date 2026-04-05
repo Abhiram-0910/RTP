@@ -59,15 +59,18 @@ except ImportError:
     print("[WARNING] slowapi not installed — rate limiting disabled.")
 
 # ── Optional Redis Cache ──────────────────────────────────────────────────────
+# ── Optional Redis Cache ──────────────────────────────────────────────────────
 try:
     import redis as redis_lib
-    _redis_client = None
-    REDIS_AVAILABLE = False
-    print("[INFO] Redis bypassed for testing — using SQLite recommendation cache.")
+    _redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    _redis_client = redis_lib.from_url(_redis_url, decode_responses=True)
+    _redis_client.ping()
+    REDIS_AVAILABLE = True
+    print(f"[OK] Redis cache connected at {_redis_url}")
 except Exception as e:
     _redis_client = None
     REDIS_AVAILABLE = False
-    print(f"[INFO] Redis not available ({e}) — using SQLite recommendation cache.")
+    print(f"[WARNING] Redis unavailable or bypassed ({e}) — using SQLite recommendation cache.")
 
 # ── Optional Celery Tasks ─────────────────────────────────────────────────────
 try:
@@ -156,13 +159,19 @@ def initialize_services():
     # 2. FAISS vector store
     try:
         from langchain_community.vectorstores import FAISS
+        from backend.security import verify_faiss_integrity
         faiss_path = os.path.join(os.path.dirname(__file__), '..', 'data', 'faiss_index')
-        vector_store = FAISS.load_local(
-            faiss_path,
-            embeddings,
-            allow_dangerous_deserialization=True,
-        )
-        print(f"[OK] FAISS index loaded from {faiss_path}.")
+        
+        # Security Check: Verify SHA-256 integrity before loading
+        if verify_faiss_integrity(faiss_path):
+            vector_store = FAISS.load_local(
+                faiss_path,
+                embeddings,
+                allow_dangerous_deserialization=True,
+            )
+            print(f"[OK] FAISS index loaded from {faiss_path}.")
+        else:
+            print(f"[SECURITY ALERT] FAISS index integrity check FAILED for {faiss_path}. Aborting load.")
     except Exception as e:
         print(f"[WARNING] FAISS index not found or failed to load: {e}")
         print("  -> Run: cd backend && python ingest_all_data.py")
@@ -674,14 +683,54 @@ def compute_similarity_factors(media: Media, query: str, score: float) -> dict[s
 
 # ── LLM Query Enhancer (Issues 3, 4, 5) ─────────────────────────────────────
 
+import re
+
+# Common Tenglish and Hinglish keywords that imply transliteration is needed
+_REGIONAL_INDICATORS = re.compile(
+    r"\b(manchi|cinemalu|chudali|kavali|bagundi|bagundhi|baga|eppudu|ekkada|ledhu|vundhi|undhi|"
+    r"acche|chahiye|hai|paisa|vasool|dikhao|dekhna|film|picture|kahani|mast|badhiya|kaun|kyun|kaisa|kab)\b",
+    re.IGNORECASE
+)
+
+# Abstract mood words that benefit from LLM expansion
+_MOOD_KEYWORDS = {
+    "feel-good", "mind-bending", "uplifting", "dark", "heavy", "light", 
+    "scary", "funny", "intense", "heartwarming", "thought-provoking", 
+    "trippy", "tear-jerker", "adventurous", "cinematic"
+}
+
 async def enhance_query(raw_query: str) -> str:
     """
-    Uses the LLM router to:
-    1. Translate Tenglish/Hinglish to English (e.g. 'manchi cinemalu' -> 'good movies')
-    2. Detect and expand mood keywords (e.g. 'feel-good' -> 'uplifting heartwarming positive family')
-    3. Return a dense, English keyword string optimized for vector embedding search.
-    Falls back to the raw query if LLM is unavailable.
+    Uses the LLM router to optimize the search query.
+    
+    Optimizations:
+    1. Redis caching for frequent regional queries.
+    2. Heuristic bypass for standard English queries avoid LLM latency.
     """
+    if not raw_query or not raw_query.strip():
+        return raw_query
+
+    normalized_q = raw_query.lower().strip()
+
+    # Step 1: Redis Cache Lookup
+    if REDIS_AVAILABLE and _redis_client:
+        try:
+            cached_val = _redis_client.get(f"q_enh:{normalized_q}")
+            if cached_val:
+                return cached_val
+        except Exception:
+            pass
+
+    # Step 2: Heuristic Bypass Check
+    # Only call LLM if the query is regional, non-ASCII, or contains abstract mood words.
+    is_regional = bool(_REGIONAL_INDICATORS.search(normalized_q))
+    has_unicode = any(ord(c) > 127 for c in normalized_q)
+    has_mood = any(mk in normalized_q for mk in _MOOD_KEYWORDS)
+
+    if not (is_regional or has_unicode or has_mood):
+        # Optimization: Standard English queries (e.g. "Action movies") bypass the LLM
+        return raw_query
+
     from backend.llm_router import llm_router
     prompt = (
         f"You are a search query optimizer for a movie/TV recommendation engine.\n"
@@ -706,6 +755,12 @@ async def enhance_query(raw_query: str) -> str:
             logging.getLogger(__name__).info(
                 "[QueryEnhancer] '%s' -> '%s'", raw_query, result
             )
+            # Step 3: Cache the success to Redis (24-hour TTL)
+            if REDIS_AVAILABLE and _redis_client:
+                try:
+                    _redis_client.setex(f"q_enh:{normalized_q}", 86400, result)
+                except Exception:
+                    pass
             return result
     except Exception as e:
         logging.getLogger(__name__).warning("[QueryEnhancer] Failed (%s), using raw query.", e)
@@ -716,7 +771,7 @@ async def enhance_query(raw_query: str) -> str:
 
 @app.post("/api/recommend")
 @limiter.limit("10/minute")
-async def get_enhanced_recommendations(
+def get_enhanced_recommendations(
     user_query: UserQuery,
     background_tasks: BackgroundTasks,
     request: Request,
@@ -786,7 +841,7 @@ async def get_enhanced_recommendations(
         #       "good action movies, feel-good, uplifting, heroic, Telugu cinema"
         original_query = user_query.query
         try:
-            enhanced_query = await enhance_query(original_query)
+            enhanced_query = asyncio.run(enhance_query(original_query))
         except Exception:
             enhanced_query = original_query
 
@@ -1128,7 +1183,7 @@ async def get_enhanced_recommendations(
 # ── Deep Analyze Endpoint ─────────────────────────────────────────────────────
 
 @app.post("/api/deep-analyze")
-async def deep_analyze(
+def deep_analyze(
     request: DeepAnalyzeRequest,
     db: Session = Depends(get_db)
 ):
@@ -1206,12 +1261,12 @@ async def deep_analyze(
         )
 
         # Step 4: Generate the analysis
-        analysis_text, provider = await llm_router.generate(
+        analysis_text, provider = asyncio.run(llm_router.generate(
             prompt=prompt,
             max_tokens=700,
             temperature=0.65,
             task_name="deep_analysis",
-        )
+        ))
 
         return {
             "analysis": analysis_text.strip(),
@@ -1783,16 +1838,44 @@ async def _generate_and_cache_explanation(user_id, query, top_media, lang):
             query, top_media, lang
         )
         for tmdb_id, text in explanations_result.items():
-            explanation_cache[str(tmdb_id)] = {
+            data_to_cache = {
                 "explanation": text,
                 "provider": explanation_provider_used
             }
+            # 1. Local Fallback Cache
+            explanation_cache[str(tmdb_id)] = data_to_cache
+
+            # 2. Redis Distributed Cache (if available)
+            if REDIS_AVAILABLE and _redis_client:
+                try:
+                    _redis_client.setex(
+                        f"expl:{tmdb_id}",
+                        600, # 10-minute TTL
+                        json.dumps(data_to_cache)
+                    )
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[BACKGROUND TASK] Explanation generation failed: {e}")
 
 @app.get("/api/explanation/{job_id}")
 async def get_explanation_by_job(job_id: str):
     """Endpoint for the frontend to poll for explanation results by tmdb_id."""
+    # 1. Try Redis first (for multi-worker consistency)
+    if REDIS_AVAILABLE and _redis_client:
+        try:
+            cached_json = _redis_client.get(f"expl:{job_id}")
+            if cached_json:
+                cached_data = json.loads(cached_json)
+                return {
+                    "ready": True, 
+                    "explanation": cached_data["explanation"], 
+                    "provider": cached_data["provider"]
+                }
+        except Exception:
+            pass
+
+    # 2. Fallback to local memory (only if not in Redis)
     if job_id in explanation_cache:
         cached_data = explanation_cache[job_id]
         return {

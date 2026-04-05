@@ -13,6 +13,7 @@ import { useAuth } from '../context/AuthContext';
 import { useAppContext } from '../context/AppContext';
 import PlatformFilter from '../components/PlatformFilter';
 import ContinueWatching from '../components/ContinueWatching';
+import VisualMoodSearch from '../components/VisualMoodSearch';
 
 // ── Filter options ─────────────────────────────────────────────────────────────
 const GENRES = ['Action', 'Comedy', 'Drama', 'Horror', 'Romance', 'Sci-Fi', 'Thriller', 'Animation', 'Documentary'];
@@ -292,8 +293,7 @@ const MovieCard = ({ movie, ratingState = {}, pending, onRate, index }) => {
 
 // ── Home Page ──────────────────────────────────────────────────────────────────
 const Home = () => {
-  const { user } = useAuth();
-  const [userId] = useState(() => user?.username || localStorage.getItem('mirai_user_id') || `user_${Date.now()}`);
+  const { userId, language } = useAppContext();
   const [query, setQuery]         = useState('');
   const [loading, setLoading]     = useState(false);
   const [results, setResults]     = useState([]);
@@ -307,7 +307,7 @@ const Home = () => {
   const [feedbackGiven, setFeedbackGiven] = useState(false);
   const [showFilters, setShowFilt]= useState(false);
   const [mediaType, setMediaType] = useState('All');
-  const [language, setLanguage]   = useState('all');
+  // Local language filter is removed in favor of global AppContext language
   const [genre, setGenre]         = useState('');
   const [mood, setMood]           = useState('');
   const [minRating, setMinRating] = useState(0);
@@ -318,6 +318,7 @@ const Home = () => {
   const [similarMovies, setSimilarMovies] = useState([]);
   const [seedMovieTitle, setSeedMovieTitle] = useState('');
   const [selectedPlatform, setSelectedPlatform] = useState(null);
+  const [showVisualSearch, setShowVisualSearch] = useState(false);
 
   useEffect(() => {
     fetchMetrics();
@@ -348,34 +349,13 @@ const Home = () => {
     }
   };
 
-  const handleImageUpload = async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-    setImageLoading(true);
-    setQuery('Analyzing visual mood...');
-    const formData = new FormData();
-    formData.append('file', file);
-    try {
-      const response = await fetch('/api/mood-from-image', {
-        method: 'POST',
-        body: formData,
-      });
-      if (!response.ok) throw new Error('Failed to analyze image');
-      const data = await response.json();
-      setQuery(data.extracted_query);
-      // Auto-trigger search with the extracted query
-      setTimeout(() => {
-        document.getElementById('search-btn')?.click();
-      }, 100);
-    } catch (error) {
-      console.error('Error analyzing image:', error);
-      toast.error('Could not analyze image. Try another one.');
-      setQuery('');
-    } finally {
-      setImageLoading(false);
-      // Reset the input so the same file can be re-uploaded
-      if (imageInputRef.current) imageInputRef.current.value = '';
-    }
+  const onVisualResults = (recs, moodQuery) => {
+    setQuery(moodQuery);
+    setResults(recs);
+    setHasSearched(true);
+    setExpl('');
+    setDeepAnalysis('');
+    window.scrollTo({ top: 600, behavior: 'smooth' });
   };
 
   const handleSearch = async (e) => {
@@ -399,6 +379,7 @@ const Home = () => {
         min_rating: minRating,
         genre: genre || null,
         language_filter: language,
+        language_preference: language,
         platforms: selectedPlatform ? [selectedPlatform] : null,
       });
       const normalized = (data.movies || data.results || []).map(item => {
@@ -537,6 +518,36 @@ const Home = () => {
         </p>
       </motion.div>
 
+      {/* ── Visual Search Toggle ────────────────────────────────────────── */}
+      <div className="flex justify-center mb-8">
+        <motion.button
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={() => setShowVisualSearch(!showVisualSearch)}
+          className={`group flex items-center gap-2 px-6 py-3 rounded-2xl text-sm font-semibold transition-all duration-500 ${
+            showVisualSearch 
+              ? 'bg-accent text-midnight-950 shadow-glow' 
+              : 'bg-white/5 border border-white/10 text-slate-300 hover:bg-white/10'
+          }`}
+        >
+          <Camera size={18} className={showVisualSearch ? 'animate-pulse' : 'group-hover:scale-110'} />
+          {showVisualSearch ? 'Close Visual Search' : 'Search by Visual Mood'}
+        </motion.button>
+      </div>
+
+      <AnimatePresence>
+        {showVisualSearch && (
+          <motion.div
+            initial={{ opacity: 0, height: 0, y: -20 }}
+            animate={{ opacity: 1, height: 'auto', y: 0 }}
+            exit={{ opacity: 0, height: 0, y: -20 }}
+            className="overflow-hidden"
+          >
+            <VisualMoodSearch onResultsFound={onVisualResults} />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* ── Search box ──────────────────────────────────────────────────── */}
       <form onSubmit={handleSearch} className="mb-4">
         <motion.div
@@ -553,25 +564,7 @@ const Home = () => {
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="e.g. dark psychological thriller, feel-good Bollywood, Akira Kurosawa style…"
-              className="w-full glow-input text-white placeholder-slate-600 rounded-2xl pl-11 pr-12 py-4 text-sm outline-none font-body"
-            />
-            {/* Camera / Visual Mood button */}
-            <button
-              type="button"
-              title="Search by image mood"
-              onClick={() => imageInputRef.current?.click()}
-              className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 rounded-lg text-slate-500 hover:text-accent hover:bg-accent/10 transition-colors"
-            >
-              {imageLoading
-                ? <Loader2 size={15} className="animate-spin" />
-                : <Camera size={15} />}
-            </button>
-            <input
-              ref={imageInputRef}
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={handleImageUpload}
+              className="w-full glow-input text-white placeholder-slate-600 rounded-2xl pl-11 pr-4 py-4 text-sm outline-none font-body"
             />
           </div>
           <motion.button

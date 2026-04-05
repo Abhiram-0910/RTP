@@ -209,6 +209,25 @@ class LLMRouter:
             metrics.record_ollama(success=False, latency_ms=0)
             raise Exception(f"Both Gemini and Ollama failed. Last error: {exc}")
 
+    def _extract_json(self, text: str) -> str:
+        """
+        Robustly extract JSON string from text that may contain markdown fences
+        or preamble/postamble conversational text.
+        """
+        # 1. Try markdown fences: ```json ... ``` or ``` ... ```
+        fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            return fence_match.group(1).strip()
+
+        # 2. No fences? Look for the first '{' or '[' and the last '}' or ']'
+        # This handles cases like: "Here is the data: {"key": "val"} hope this helps!"
+        span_match = re.search(r"([\[{].*[\]}])", text, re.DOTALL)
+        if span_match:
+            return span_match.group(1).strip()
+
+        # 3. Fallback to basic strip
+        return text.strip()
+
     async def generate_json(
         self,
         prompt: str,
@@ -236,13 +255,8 @@ class LLMRouter:
 
         text, provider = await self.generate(full_prompt, max_tokens, temperature, task_name)
 
-        # ── Clean markdown fences ─────────────────────────────────────────────
-        cleaned = text.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned[cleaned.find("\n") + 1:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:cleaned.rfind("```")]
-        cleaned = cleaned.strip()
+        # ── Clean markdown fences and preamble ────────────────────────────────
+        cleaned = self._extract_json(text)
 
         try:
             return json.loads(cleaned), provider
@@ -252,7 +266,7 @@ class LLMRouter:
                 f"The following is malformed JSON. Fix it and return ONLY the corrected JSON:\n{cleaned}"
             )
             text2, provider2 = await self.generate(retry_prompt, max_tokens, 0.1, task_name + "_retry")
-            cleaned2 = text2.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+            cleaned2 = self._extract_json(text2)
             return json.loads(cleaned2), provider2
 
     def get_status(self) -> dict:

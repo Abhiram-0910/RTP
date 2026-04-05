@@ -1,5 +1,5 @@
 """
-MIRAI — JustWatch async client
+MIRAI — JustWatch sync client
 ================================
 Queries the unofficial JustWatch REST API to retrieve streaming-platform
 availability for a given title.  Used as **enrichment** on top of TMDB
@@ -8,7 +8,7 @@ this client is called to fill the gap.
 
 Key design decisions
 ---------------------
-- ``aiohttp`` (async I/O) with a 3-second hard timeout — never blocks.
+- ``requests`` (sync I/O) with a 3-second hard timeout.
 - In-process ``TTLCache`` (1-hour TTL, 2 000 slots) — no external service.
 - Title fuzz-match via ``difflib.SequenceMatcher`` (≥ 0.75 ratio) to avoid
   returning data for a mismatched result.
@@ -18,29 +18,27 @@ Key design decisions
 Usage::
 
     client = JustWatchClient()
-    platforms = await client.get_platforms("Inception", year=2010)
+    platforms = client.get_platforms("Inception", year=2010)
     # → ["Netflix", "Prime Video"]
-    await client.close()
 """
 
 from __future__ import annotations
 
-import asyncio
 import difflib
 import logging
 from typing import Optional
 
-import aiohttp
+import requests
 from cachetools import TTLCache
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Singleton aiohttp session — created lazily, shared across calls
+# Singleton session — created lazily, shared across calls
 # ---------------------------------------------------------------------------
 
 _JUSTWATCH_BASE = "https://apis.justwatch.com/content/titles/en_IN/popular"
-_TIMEOUT = aiohttp.ClientTimeout(total=3)
+_TIMEOUT = 3 # seconds
 _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Content-Type": "application/json",
@@ -50,7 +48,7 @@ _HEADERS = {
 
 class JustWatchClient:
     """
-    Async JustWatch client with TTL caching and fuzzy title matching.
+    Sync JustWatch client with TTL caching and fuzzy title matching.
 
     Create one instance at application startup and reuse it:
 
@@ -65,7 +63,7 @@ class JustWatchClient:
 
     def __init__(self) -> None:
         self.base_url: str = _JUSTWATCH_BASE
-        self._session: aiohttp.ClientSession | None = None
+        self._session: requests.Session | None = None
         # 2 000 titles × 1-hour TTL — fits comfortably in RAM (~few MB)
         self.cache: TTLCache = TTLCache(maxsize=2000, ttl=3600)
 
@@ -73,13 +71,11 @@ class JustWatchClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_session(self) -> aiohttp.ClientSession:
+    def _get_session(self) -> requests.Session:
         """Return the shared session, creating it lazily if needed."""
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                headers=_HEADERS,
-                timeout=_TIMEOUT,
-            )
+        if self._session is None:
+            self._session = requests.Session()
+            self._session.headers.update(_HEADERS)
         return self._session
 
     @staticmethod
@@ -93,7 +89,7 @@ class JustWatchClient:
     # Public API
     # ------------------------------------------------------------------
 
-    async def get_platforms(
+    def get_platforms(
         self,
         title: str,
         year: Optional[int] = None,
@@ -129,18 +125,18 @@ class JustWatchClient:
                 "query": title.strip(),
             }
 
-            async with session.post(self.base_url, json=payload) as resp:
-                if resp.status != 200:
-                    logger.debug(
-                        "[JustWatch] Non-200 response (%s) for title '%s'",
-                        resp.status, title,
-                    )
-                    self.cache[cache_key] = []
-                    return []
+            resp = session.post(self.base_url, json=payload, timeout=_TIMEOUT)
+            if resp.status_code != 200:
+                logger.debug(
+                    "[JustWatch] Non-200 response (%s) for title '%s'",
+                    resp.status_code, title,
+                )
+                self.cache[cache_key] = []
+                return []
 
-                data = await resp.json(content_type=None)
+            data = resp.json()
 
-        except asyncio.TimeoutError:
+        except requests.exceptions.Timeout:
             logger.debug("[JustWatch] Timeout for title '%s'", title)
             return []
         except Exception as exc:
@@ -181,12 +177,6 @@ class JustWatchClient:
 
         self.cache[cache_key] = platforms
         return platforms
-
-    async def close(self) -> None:
-        """Close the underlying aiohttp session. Call on application shutdown."""
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
 
 
 # ---------------------------------------------------------------------------
