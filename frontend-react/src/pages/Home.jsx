@@ -293,7 +293,7 @@ const MovieCard = ({ movie, ratingState = {}, pending, onRate, index }) => {
 
 // ── Home Page ──────────────────────────────────────────────────────────────────
 const Home = () => {
-  const { userId, language } = useAppContext();
+  const { userId, language, setLanguage } = useAppContext();
   const [query, setQuery]         = useState('');
   const [loading, setLoading]     = useState(false);
   const [results, setResults]     = useState([]);

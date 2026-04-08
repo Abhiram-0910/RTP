@@ -212,9 +212,9 @@ def _prewarm_embedding_cache():
     ]
     try:
         from backend.rag_chain import rag_chain_instance
-        if rag_chain_instance and rag_chain_instance.embeddings:
+        if rag_chain_instance and rag_chain_instance._embeddings:
             for q in common_queries:
-                rag_chain_instance.embeddings.embed_query(q)
+                rag_chain_instance._embeddings.embed_query(q)
             print("[OK] Embedding cache pre-warmed.")
     except Exception as e:
         print(f"Failed to pre-warm cache: {e}")
@@ -696,7 +696,8 @@ _REGIONAL_INDICATORS = re.compile(
 _MOOD_KEYWORDS = {
     "feel-good", "mind-bending", "uplifting", "dark", "heavy", "light", 
     "scary", "funny", "intense", "heartwarming", "thought-provoking", 
-    "trippy", "tear-jerker", "adventurous", "cinematic"
+    "trippy", "tear-jerker", "adventurous", "cinematic", "depression", 
+    "sad", "lonely", "breakup", "bored", "depressed", "anxiety"
 }
 
 async def enhance_query(raw_query: str) -> str:
@@ -739,7 +740,8 @@ async def enhance_query(raw_query: str) -> str:
         "1. If the input contains transliterated regional language (Tenglish/Hinglish like 'manchi action cinemalu', "
         "'acche feel-good movies chahiye', 'paisa vasool entertainment'), translate each word to English.\n"
         "2. Identify the mood/vibe (e.g. 'dark', 'feel-good', 'mind-bending', 'emotional').\n"
-        "3. Expand abstract concepts into concrete English film keywords, genres, themes, and descriptors.\n\n"
+        "3. Expand abstract concepts into concrete English film keywords, genres, themes, and descriptors.\n"
+        "4. If the input expresses negative emotions (depression, sad, lonely), include positive counter-moods (uplifting, feel-good, inspiring) to help them overcome it.\n\n"
         "Return ONLY a comma-separated list of precise English keywords/phrases that capture the user's exact intent. "
         "No explanations. No conversational text. Just the optimized keywords."
     )
@@ -879,7 +881,7 @@ def get_enhanced_recommendations(
         _active_filters = bool(user_query.genre or user_query.platforms)
         
         if is_lang_filter:
-            _search_k = 1200
+            _search_k = 10000
         elif _active_filters:
             _search_k = 150
         else:
